@@ -27,11 +27,349 @@
 
 
 #include "screen_thread.h"
+#include "ds2302_raw_shared.h"
+#include <QMutex>
+#include <QMutexLocker>
+#include <QStringList>
+#include <QByteArray>
+#include <QVector>
+#include <cmath>
+#include <cstring>
+#include <cstdio>
 
 
 #define SPECT_LOG_MINIMUM (0.00000001)
 #define SPECT_LOG_MINIMUM_LOG (-80)
 
+
+
+void ds2_raw_progress(unsigned generation, int received, int expected);
+
+// --- DS2302 STOP/RAW: shared capture state; all instrument I/O stays here ---
+namespace {
+QMutex ds2_raw_mutex;
+DS2RawSnapshot ds2_raw_state;
+bool ds2_raw_pending = false;
+// Higher STOP/RAW cap. The current LAN path accepts up to 2 MiB per binary block;
+// this cap keeps a single channel below 1 MiB of raw ADC data.
+constexpr int DS2_RAW_SAFE_POINT_LIMIT = 1000000;
+
+bool ds2_scpi_write(const QString &s)
+{
+  const QByteArray cmd = s.toLatin1();
+  return tmc_write(cmd.constData()) == cmd.size();
+}
+
+bool ds2_scpi_query(struct tmcdev *device, const QString &command, QString &answer)
+{
+  if(!ds2_scpi_write(command)) return false;
+  const int n = tmc_read();
+  if(n <= 0 || n > 512 || !device || !device->buf) return false;
+  answer = QString::fromLatin1(device->buf, n).trimmed();
+  return !answer.isEmpty();
+}
+
+bool ds2_capture_channel(struct tmcdev *device, int ch, int depth,
+                         DS2RawTrace &result, QString &why,
+                         unsigned generation, int completed_before, int expected_total)
+{
+  if(depth < 2 || depth > DS2_RAW_SAFE_POINT_LIMIT)
+  {
+    why = QString("Speichertiefe %1 ausserhalb des RAW-Limits 2..%2")
+        .arg(depth).arg(DS2_RAW_SAFE_POINT_LIMIT);
+    return false;
+  }
+
+  // Only the source needs preserving: DSRemote itself always uses
+  // NORM/BYTE/1..1400 outside the STOP/RAW analysis mode.
+  // IMPORTANT: Restoring the old :WAV:POIN? value can re-apply the
+  // corrupt 0/1/900-point range left over from a previous RAW read.
+  QString old_source;
+  if(!ds2_scpi_query(device, ":WAV:SOUR?", old_source))
+  {
+    why = "Waveform-Quelle nicht lesbar";
+    return false;
+  }
+
+  bool touched = false;
+  bool good = false;
+  do {
+    touched = true; // Even an incomplete RAW setup requires NORM cleanup.
+    if(!ds2_scpi_write(QString(":WAV:SOUR CHAN%1").arg(ch + 1)) ||
+       !ds2_scpi_write(":WAV:FORM BYTE") ||
+       !ds2_scpi_write(":WAV:MODE RAW") ||
+       !ds2_scpi_write(QString(":WAV:POIN %1").arg(depth)) ||
+       !ds2_scpi_write(":WAV:STAR 1") ||
+       !ds2_scpi_write(QString(":WAV:STOP %1").arg(depth)))
+    {
+      why = "RAW-Konfiguration gescheitert";
+      break;
+    }
+
+    QString mode, fmt, start, stop, pre;
+    if(!ds2_scpi_query(device, ":WAV:MODE?", mode) ||
+       !ds2_scpi_query(device, ":WAV:FORM?", fmt) ||
+       !ds2_scpi_query(device, ":WAV:STAR?", start) ||
+       !ds2_scpi_query(device, ":WAV:STOP?", stop) ||
+       mode.compare("RAW", Qt::CaseInsensitive) != 0 ||
+       fmt.compare("BYTE", Qt::CaseInsensitive) != 0 ||
+       start.toInt() != 1 || stop.toInt() != depth)
+    {
+      why = "RAW-Konfiguration vom Geraet nicht bestaetigt";
+      break;
+    }
+    if(!ds2_scpi_query(device, ":WAV:PRE?", pre))
+    {
+      why = "RAW-Preamble fehlt";
+      break;
+    }
+    const QStringList fields = pre.split(',');
+    if(fields.size() != 10 || fields[1].toInt() != 2)
+    {
+      why = QString("Unerwartete RAW-Preamble: %1").arg(pre);
+      break;
+    }
+    bool ok[6] = {false, false, false, false, false, false};
+    result.xincrement = fields[4].toDouble(&ok[0]);
+    result.xorigin = fields[5].toDouble(&ok[1]);
+    result.xreference = fields[6].toDouble(&ok[2]);
+    result.yincrement = fields[7].toDouble(&ok[3]);
+    result.yorigin = fields[8].toDouble(&ok[4]);
+    result.yreference = fields[9].toDouble(&ok[5]);
+    bool numbers_ok = true;
+    for(int i = 0; i < 6; ++i) numbers_ok = numbers_ok && ok[i];
+    if(!numbers_ok || !(result.xincrement > 0.0) ||
+       !(result.yincrement > 0.0) ||
+       !std::isfinite(result.xorigin) || !std::isfinite(result.yorigin))
+    {
+      why = "Ungueltige RAW-Zeit-/Spannungskalibrierung";
+      break;
+    }
+
+    if(!ds2_scpi_write(":WAV:RESet") || !ds2_scpi_write(":WAV:BEGin"))
+    {
+      why = "RAW-Transfer konnte nicht gestartet werden";
+      break;
+    }
+    result.bytes.reserve(depth);
+    // DS2302 firmware may first reply READ,0 with an empty IEEE-488.2
+    // binary block, then deliver the requested bytes in later blocks.
+    // Observed with 280000 samples: READ,0 -> READ,126945 -> IDLE,153055.
+    // A zero-length block is NOT a transfer error while status is READ.
+    int consecutive_empty_blocks = 0;
+    for(int block = 0; block < 32 && result.bytes.size() < depth; ++block)
+    {
+      QString status;
+      if(!ds2_scpi_query(device, ":WAV:STAT?", status) ||
+         !ds2_scpi_write(":WAV:DATA?"))
+      {
+        why = "RAW-Blockstatus oder Datenabfrage gescheitert";
+        break;
+      }
+      const int n = tmc_read();
+      const bool still_reading = status.startsWith("READ", Qt::CaseInsensitive);
+      const bool finished = status.startsWith("IDLE", Qt::CaseInsensitive);
+      fprintf(stderr, "DS2302 RAW CH%d: Block %d, Status=%s, Bytes=%d, Summe=%d/%d\n",
+              ch + 1, block + 1, status.toLatin1().constData(), n,
+              result.bytes.size() + (n > 0 ? n : 0), depth);
+
+      if(!still_reading && !finished)
+      {
+        why = QString("Unbekannter RAW-Blockstatus: %1").arg(status);
+        break;
+      }
+      if(n < 0 || n > depth - result.bytes.size() || (n > 0 && !device->buf))
+      {
+        why = QString("Ungueltige RAW-Blocklaenge %1 (%2)").arg(n).arg(status);
+        break;
+      }
+      if(n == 0)
+      {
+        ++consecutive_empty_blocks;
+        if(finished)
+        {
+          why = QString("RAW beendet nach %1/%2 Bytes (letzter Block leer)")
+              .arg(result.bytes.size()).arg(depth);
+          break;
+        }
+        if(consecutive_empty_blocks >= 5)
+        {
+          why = "RAW: 5 leere READ-Bloecke hintereinander";
+          break;
+        }
+        usleep(100000);  // Give the stopped DS2302 time to prepare data.
+        continue;
+      }
+      consecutive_empty_blocks = 0;
+      const int old_size = result.bytes.size();
+      result.bytes.resize(old_size + n);
+      std::memcpy(result.bytes.data() + old_size, device->buf, n);
+      ds2_raw_progress(generation, completed_before + result.bytes.size(), expected_total);
+      if(finished) break;
+    }
+    if(result.bytes.size() != depth)
+    {
+      if(why.isEmpty())
+        why = QString("RAW unvollstaendig: %1/%2 Bytes").arg(result.bytes.size()).arg(depth);
+      break;
+    }
+    result.first_point = 1;
+    good = true;
+  } while(false);
+
+  // Mandatory cleanup after EVERY RAW attempt, successful or not.
+  // This exact order was verified on the DS2302 with two enabled channels:
+  // :WAV:POIN 1400 changes both STAR and STOP to 1..1400.
+  // The oscilloscope remains STOP; no acquisition settings are changed.
+  if(touched)
+  {
+    const QStringList commands = QStringList()
+        << ":WAV:END"
+        << (QString(":WAV:SOUR ") + old_source)
+        << ":WAV:MODE NORM"
+        << ":WAV:FORM BYTE"
+        << ":WAV:POIN 1400"
+        << ":WAV:STAR 1"
+        << ":WAV:STOP 1400";
+    bool restored = true;
+    // Do not short-circuit: even if one command fails, continue attempting
+    // the remaining recovery commands.
+    for(const QString &command : commands)
+    {
+      if(!ds2_scpi_write(command))
+      {
+        restored = false;
+        fprintf(stderr, "DS2302 RAW: cleanup command failed: %s\n",
+                command.toLatin1().constData());
+      }
+    }
+
+    if(restored)
+    {
+      QString mode, format, points, start, stop;
+      restored = ds2_scpi_query(device, ":WAV:MODE?", mode) &&
+                 ds2_scpi_query(device, ":WAV:FORM?", format) &&
+                 ds2_scpi_query(device, ":WAV:POIN?", points) &&
+                 ds2_scpi_query(device, ":WAV:STAR?", start) &&
+                 ds2_scpi_query(device, ":WAV:STOP?", stop) &&
+                 mode.compare("NORM", Qt::CaseInsensitive) == 0 &&
+                 format.compare("BYTE", Qt::CaseInsensitive) == 0 &&
+                 points.toInt() == 1400 && start.toInt() == 1 &&
+                 stop.toInt() == 1400;
+      if(!restored)
+        fprintf(stderr, "DS2302 RAW: NORM 1..1400 verification failed\n");
+    }
+    if(!restored)
+    {
+      why += " (WARNUNG: NORM 1..1400 konnte nicht bestaetigt werden)";
+      return false;
+    }
+  }
+  return good;
+}
+} // namespace
+
+DS2RawSnapshot ds2_raw_snapshot()
+{
+  QMutexLocker lock(&ds2_raw_mutex);
+  return ds2_raw_state;
+}
+
+// All RAW-state changes are serialized; the Qt GUI never accesses SCPI directly.
+static bool ds2_has_cached_locked()
+{
+  for(int c=0; c<4; ++c)
+    if(ds2_raw_state.traces[c].valid()) return true;
+  return false;
+}
+
+void ds2_raw_toggle()
+{
+  QMutexLocker lock(&ds2_raw_mutex);
+  if(ds2_raw_state.busy) return;
+  if(ds2_raw_state.enabled)
+  {
+    // NORM: keep the RAW cache intact, never re-fetch on a simple toggle.
+    ds2_raw_state.enabled = false;
+    ds2_raw_state.message = "NORM (RAW gespeichert)";
+  }
+  else if(ds2_has_cached_locked())
+  {
+    ds2_raw_state.enabled = true; // read only; no communication
+    ds2_raw_state.message = ds2_raw_state.stale
+        ? "RAW gespeichert (Aufnahme inzwischen geaendert)" : "RAW gespeichert";
+  }
+  // No cache: do not fetch implicitly. Only "RAW laden" starts I/O.
+  // This also prevents turning on a misleading empty SNAPSHOT mode.
+}
+
+bool ds2_raw_reload()
+{
+  QMutexLocker lock(&ds2_raw_mutex);
+  if(ds2_raw_state.busy) return false;
+  ++ds2_raw_state.generation;
+  ds2_raw_state.enabled = true;
+  ds2_raw_state.busy = true;
+  ds2_raw_state.progress_done = 0;
+  ds2_raw_state.progress_total = 0;
+  ds2_raw_state.message = "RAW lade Daten ...";
+  ds2_raw_state.load_failed = false;
+  // Keep the old cache until a successful replacement has arrived.
+  ds2_raw_pending = true;
+  return true;
+}
+
+void ds2_raw_progress(unsigned generation, int received, int expected)
+{
+  QMutexLocker lock(&ds2_raw_mutex);
+  if(ds2_raw_state.generation != generation || !ds2_raw_state.busy) return;
+  ds2_raw_state.progress_done = received;
+  ds2_raw_state.progress_total = expected;
+}
+
+void ds2_raw_cancel_if_running()
+{
+  QMutexLocker lock(&ds2_raw_mutex);
+  // RUN does not destroy a captured STOP waveform. It only marks it as old.
+  if(ds2_has_cached_locked()) ds2_raw_state.stale = true;
+}
+
+bool ds2_raw_take_request(unsigned &generation)
+{
+  QMutexLocker lock(&ds2_raw_mutex);
+  if(!ds2_raw_pending) return false;
+  ds2_raw_pending = false;
+  generation = ds2_raw_state.generation;
+  return true;
+}
+
+void ds2_raw_publish(unsigned generation, const DS2RawSnapshot &state)
+{
+  QMutexLocker lock(&ds2_raw_mutex);
+  if(ds2_raw_state.generation != generation) return;
+  const bool visible = ds2_raw_state.enabled;
+  bool any_new = false;
+  for(int i=0; i<4; ++i) any_new |= state.traces[i].valid();
+  if(state.complete && any_new)
+  {
+    // Atomic replacement: all requested channels must be present.
+    // A new CH1-only capture also removes a CH2 trace from the old cache.
+    for(int i=0; i<4; ++i) ds2_raw_state.traces[i] = state.traces[i];
+    ds2_raw_state.complete = true;
+    ds2_raw_state.stale = false;
+    ds2_raw_state.load_failed = false;
+  }
+  else
+  {
+    // A failed refresh does not destroy or partly replace a good snapshot.
+    ds2_raw_state.load_failed = true;
+  }
+  // Failed refresh does not destroy a previously successful cache.
+  ds2_raw_state.message = state.message;
+  ds2_raw_state.enabled = visible;
+  ds2_raw_state.busy = false;
+  ds2_raw_state.progress_done = ds2_raw_state.progress_total;
+}
 
 void screen_thread::set_device(struct tmcdev *tmdev)
 {
@@ -643,6 +981,10 @@ void screen_thread::run()
 
   params.error_stat = get_devicestatus();
 
+  // RUN invalidates a cached STOP snapshot; never show old RAW as live data.
+  if(params.modelserie == 2 && !params.error_stat && params.triggerstatus != 5)
+    ds2_raw_cancel_if_running();
+
   if(params.error_stat)
   {
     h_busy = 0;
@@ -672,6 +1014,60 @@ void screen_thread::run()
     h_busy = 0;
 
     return;
+  }
+
+  // Capture on demand only. The normal NORM channel loop below is unchanged.
+  // The request is set by Ctrl+Shift+R in SignalCurve, NEVER by the worker.
+  if(params.modelserie == 2)
+  {
+    unsigned ticket = 0;
+    if(ds2_raw_take_request(ticket))
+    {
+      DS2RawSnapshot snap;
+      snap.enabled = true;
+      if(params.triggerstatus != 5)
+      {
+        snap.message = "RAW nur im STOP-Zustand verfuegbar. Umschalten und erneut versuchen.";
+      }
+      else
+      {
+        const int depth = params.memdepth;
+        if(depth < 2 || depth > DS2_RAW_SAFE_POINT_LIMIT)
+        {
+          snap.message = QString("RAW: Speichertiefe %1 ausserhalb Limit 2..%2. Keine Daten gelesen.")
+              .arg(depth).arg(DS2_RAW_SAFE_POINT_LIMIT);
+        }
+        else
+        {
+          bool success = true;
+          int nch = 0;
+          const int requested_channels = int(bool(params.chandisplay[0])) +
+                                         int(bool(params.chandisplay[1]));
+          const int expected_total = depth * requested_channels;
+          ds2_raw_progress(ticket, 0, expected_total);
+          for(int channel = 0; channel < 2; ++channel)
+          {
+            if(!params.chandisplay[channel]) continue;
+            ++nch;
+            QString reason;
+            if(!ds2_capture_channel(device, channel, depth, snap.traces[channel], reason,
+                                    ticket, (nch - 1) * depth, expected_total))
+            {
+              success = false;
+              snap.message = QString("RAW CH%1: %2").arg(channel+1).arg(reason);
+              break;
+            }
+          }
+          if(success)
+          {
+            snap.complete = true;
+            snap.message = QString("RAW STOP: %1 Punkt(e) je Kanal, %2 Kanal/Kanaele")
+                              .arg(depth).arg(nch);
+          }
+        }
+      }
+      ds2_raw_publish(ticket, snap);
+    }
   }
 
   params.result = TMC_THRD_RESULT_SCRN;

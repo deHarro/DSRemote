@@ -463,6 +463,9 @@ void UI_Mainwindow::horScaleDialChanged(int new_pos)
 
   char str[512];
 
+  // DS2302_TPOS_TRIGGER_FIX_V1: alte Haupt-Zeitbasis fuer Anzeigeabgleich merken
+  const double ds2302_scale_before = devparms.timebasescale;
+
   diff = new_pos - old_pos;
 
   if(diff < 0)
@@ -648,6 +651,14 @@ void UI_Mainwindow::horScaleDialChanged(int new_pos)
     else
     {
       devparms.timebasescale = round_down_step125(devparms.timebasescale, NULL);
+    }
+
+    // DS2302_TPOS_TRIGGER_FIX_V1: nur lokaler Anzeigewert, kein SCPI-Schreibbefehl
+    // Am DS2302 im Modus TPOS gilt: timebaseoffset / timebasescale = konstant.
+    if(devparms.modelserie == 2 && devparms.timebasehrefmode == 1 &&
+       ds2302_scale_before > 0.0 && devparms.timebasescale > 0.0)
+    {
+      devparms.timebaseoffset *= devparms.timebasescale / ds2302_scale_before;
     }
 
     devparms.current_screen_sf = 100.0 / devparms.timebasescale;
@@ -1499,6 +1510,60 @@ void UI_Mainwindow::set_acq_average()
 
 void UI_Mainwindow::cursButtonClicked()
 {
+  // DS2000_XY_CURSOR_V2: rein lokale Messcursor, keine SCPI-Kommandos.
+  if(devparms.modelserie != 2)
+  {
+    statusLabel->setText("Messcursor bisher nur fuer DS2000/DS2302");
+    return;
+  }
+
+  // Vier Zustaende: aus -> Zeit -> Spannung -> beide -> aus.
+  bool x = waveForm->property("ds2_cursor_enabled").toBool();
+  bool y = waveForm->property("ds2_y_cursor_enabled").toBool();
+  if(!x && !y)
+  {
+    x = true;
+  }
+  else if(x && !y)
+  {
+    x = false;
+    y = true;
+  }
+  else if(!x && y)
+  {
+    x = true;
+    y = true;
+  }
+  else
+  {
+    x = false;
+    y = false;
+  }
+
+  waveForm->setProperty("ds2_cursor_enabled", x);
+  waveForm->setProperty("ds2_y_cursor_enabled", y);
+
+  if(x && y)
+  {
+    cursButton->setStyleSheet("background: #CC99FF;");
+    statusLabel->setText("Zeit- und Spannungs-Cursor: Linien mit linker Maustaste ziehen");
+  }
+  else if(x)
+  {
+    cursButton->setStyleSheet("background: #66FF99;");
+    statusLabel->setText("Zeit-Cursor A/B: Linien mit linker Maustaste ziehen");
+  }
+  else if(y)
+  {
+    cursButton->setStyleSheet("background: #66CCFF;");
+    statusLabel->setText("Spannungs-Cursor YA/YB: Linien mit linker Maustaste ziehen");
+  }
+  else
+  {
+    cursButton->setStyleSheet("");
+    statusLabel->setText("Messcursor aus");
+  }
+  waveForm->update();
 }
 
 

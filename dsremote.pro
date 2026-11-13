@@ -128,3 +128,4 @@ udev_rule.files += install/30-usbtmc.rules
 INSTALLS += udev_rule
 
 RC_FILE = dsremote.rc
+win32:LIBS += -lws2_32

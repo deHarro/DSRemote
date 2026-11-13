@@ -28,8 +28,920 @@
 
 
 #include "signalcurve.h"
+#include "ds2302_raw_shared.h"
+#include <QShortcut>
+#include <QKeySequence>
+#include <QToolTip>
+#include <QCursor>
+#include <QPointF>
+#include <QToolButton>
+#include <QProgressBar>
+#include <QElapsedTimer>
+#include <QHBoxLayout>
+#include <QStringList>
 
 #include "time.h"
+
+#include <QWheelEvent>
+#include <QEvent>
+#include <QVariant>
+#include <QDockWidget>
+#include <QMainWindow>
+#include <QVBoxLayout>
+#include <QLabel>
+#include <QPointer>
+#include <QByteArray>
+#include <QSizePolicy>
+#include <QTimer>
+#include <cmath>
+#include <algorithm>
+
+// DS2000 display-only horizontal zoom, independent of the instrument timebase.
+// Event filter avoids changing signalcurve.h or the existing trigger/marker handlers.
+namespace {
+// Display-only time scale: readable SI units, without changing instrument settings.
+static QString ds2_format_time_per_div(double seconds)
+{
+  double scaled = seconds;
+  const char *unit = "s/div";
+  if(seconds >= 1e-3 && seconds < 1.0)
+  {
+    scaled = seconds * 1e3;
+    unit = "ms/div";
+  }
+  else if(seconds >= 1e-6 && seconds < 1e-3)
+  {
+    scaled = seconds * 1e6;
+    unit = "\xC2\xB5s/div"; // UTF-8: micro sign
+  }
+  else if(seconds >= 1e-9 && seconds < 1e-6)
+  {
+    scaled = seconds * 1e9;
+    unit = "ns/div";
+  }
+  else if(seconds > 0.0 && seconds < 1e-9)
+  {
+    scaled = seconds * 1e12;
+    unit = "ps/div";
+  }
+  return QString::number(scaled, 'g', 4) + " " + QString::fromUtf8(unit);
+}
+
+// Return the next finer/coarser 1-2-5 time/div value (seconds).
+// The instrument's timebase is never changed, only the local display zoom.
+static double ds2_adjacent_time_per_div(double current, bool finer)
+{
+  if(!(current > 0.0) || !std::isfinite(current)) return current;
+  const double decade = std::floor(std::log10(current));
+  const double factors[] = {1.0, 2.0, 5.0};
+  double best = finer ? 0.0 : HUGE_VAL;
+  const double tolerance = current * 1e-9;
+
+  for(int i = -2; i <= 2; ++i)
+  {
+    const double power = std::pow(10.0, decade + i);
+    for(int j = 0; j < 3; ++j)
+    {
+      const double candidate = factors[j] * power;
+      if(finer && candidate < current - tolerance && candidate > best)
+        best = candidate;
+      if(!finer && candidate > current + tolerance && candidate < best)
+        best = candidate;
+    }
+  }
+  return (std::isfinite(best) && best > 0.0) ? best : current;
+}
+
+// Display-only cursor measurements; seconds are relative to the trigger.
+static QString ds2_format_seconds(double seconds)
+{
+  const double abs_seconds = std::fabs(seconds);
+  double scaled = seconds;
+  const char *unit = "s";
+  if(abs_seconds >= 1e-3 && abs_seconds < 1.0)
+  {
+    scaled = seconds * 1e3;
+    unit = "ms";
+  }
+  else if(abs_seconds >= 1e-6 && abs_seconds < 1e-3)
+  {
+    scaled = seconds * 1e6;
+    unit = "\xC2\xB5s";
+  }
+  else if(abs_seconds >= 1e-9 && abs_seconds < 1e-6)
+  {
+    scaled = seconds * 1e9;
+    unit = "ns";
+  }
+  else if(abs_seconds > 0.0 && abs_seconds < 1e-9)
+  {
+    scaled = seconds * 1e12;
+    unit = "ps";
+  }
+  return QString::number(scaled, 'g', 5) + " " + QString::fromUtf8(unit);
+}
+
+static QString ds2_format_frequency(double seconds)
+{
+  if(!(seconds > 0.0) || !std::isfinite(seconds))
+    return QString::fromUtf8("--");
+  const double hz = 1.0 / seconds;
+  double scaled = hz;
+  const char *unit = "Hz";
+  if(hz >= 1e9)      { scaled = hz / 1e9; unit = "GHz"; }
+  else if(hz >= 1e6) { scaled = hz / 1e6; unit = "MHz"; }
+  else if(hz >= 1e3) { scaled = hz / 1e3; unit = "kHz"; }
+  return QString::number(scaled, 'g', 5) + " " + unit;
+}
+
+// Voltage cursor labels with convenient SI prefixes.
+static QString ds2_format_volts(double voltage)
+{
+  if(!std::isfinite(voltage)) return QString("--");
+  const double av = std::fabs(voltage);
+  double scaled = voltage;
+  const char *unit = "V";
+  if(av >= 1000.0)
+  {
+    scaled = voltage / 1000.0;
+    unit = "kV";
+  }
+  else if(av > 0.0 && av < 1e-3)
+  {
+    if(av >= 1e-6) { scaled = voltage * 1e6; unit = "\xC2\xB5V"; }
+    else            { scaled = voltage * 1e9; unit = "nV"; }
+  }
+  else if(av >= 1e-3 && av < 1.0)
+  {
+    scaled = voltage * 1e3;
+    unit = "mV";
+  }
+  return QString::number(scaled, 'g', 5) + " " + QString::fromUtf8(unit);
+}
+
+// Small real Qt controls in the existing LOWER black instrument status strip.
+// These do not occupy the crowded top Rigol status row.
+class DS2RawControls : public QWidget
+{
+public:
+  QToolButton *toggleButton;
+  QToolButton *reloadButton;
+  QLabel *statusLabel;
+  QProgressBar *progressBar;
+
+  // GUI-only timing estimate. Do NOT change the real RAW block reader.
+  QElapsedTimer loadTimer;
+  bool loadWasBusy = false;
+  unsigned activeGeneration = 0;
+  int activeExpectedBytes = 0;
+  int learnedBytes = 0;
+  qint64 learnedMs = 0;
+  int lastEstimatedPercent = 0;
+
+  explicit DS2RawControls(QWidget *parent) : QWidget(parent)
+  {
+    setObjectName("DS2302RawControls");
+    setAttribute(Qt::WA_StyledBackground, true);
+    setStyleSheet(
+      "QWidget#DS2302RawControls { background: #202020; }"
+      "QToolButton { color: #dfdfdf; background: #333333; border: 1px solid #777; "
+      "border-radius: 3px; padding: 1px 3px; font-size: 11px; }"
+      "QToolButton:checked { color: #69eea7; border: 1px solid #69eea7; }"
+      "QToolButton:disabled { color: #666; background: #252525; border-color: #454545; }"
+      "QProgressBar { background: #202020; color: white; border: 1px solid #777; "
+      "border-radius: 3px; text-align: center; font-size: 11px; }"
+      "QProgressBar::chunk { background: #e3bc57; }"
+    );
+    QHBoxLayout *layout = new QHBoxLayout(this);
+    layout->setContentsMargins(2, 1, 2, 1);
+    layout->setSpacing(5);
+    toggleButton = new QToolButton(this);
+    toggleButton->setText("RAW");
+    toggleButton->setCheckable(true);
+    toggleButton->setFixedWidth(43);
+    toggleButton->setToolTip("Zwischen NORM und gespeicherter RAW-Aufnahme wechseln");
+    reloadButton = new QToolButton(this);
+    reloadButton->setText("RAW laden");
+    reloadButton->setFixedWidth(78);
+    reloadButton->setToolTip("Erfassungsspeicher neu laden (nur im STOP-Zustand)");
+    statusLabel = new QLabel("NORM", this);
+    statusLabel->setAlignment(Qt::AlignVCenter | Qt::AlignRight);
+    statusLabel->setStyleSheet("color: #bbb; background: transparent; font-size: 11px;");
+    statusLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    progressBar = new QProgressBar(this);
+    progressBar->setFixedHeight(19);
+    progressBar->setTextVisible(true);
+    progressBar->setRange(0, 100);
+    progressBar->setFormat("RAW ~%p%"); // elapsed-time estimate, not bytes
+    progressBar->setToolTip("Geschaetzter Ladefortschritt aus gemessenen Zeiten. "
+                            "100 % erst nach erfolgreichem Empfang.");
+    progressBar->hide();
+    layout->addWidget(toggleButton);
+    layout->addWidget(reloadButton);
+    layout->addWidget(statusLabel, 1);
+    layout->addWidget(progressBar, 1);
+    hide();
+  }
+
+  void refresh(bool device_is_ds2000, bool connected, bool stopped,
+               unsigned live_channel_mask)
+  {
+    if(!device_is_ds2000 || !connected || width() < 250) { hide(); return; }
+    if(!isVisible()) show();
+    const DS2RawSnapshot s = ds2_raw_snapshot();
+    QStringList stored_channels;
+    QStringList live_channels;
+    int points = 0;
+    double interval = 0.0;
+    for(int ch = 0; ch < 4; ++ch)
+    {
+      if(live_channel_mask & (1u << ch))
+        live_channels << QString("CH%1").arg(ch + 1);
+      if(s.traces[ch].valid())
+      {
+        stored_channels << QString("CH%1").arg(ch + 1);
+        points = s.traces[ch].bytes.size();
+        interval = s.traces[ch].xincrement;
+      }
+    }
+    const bool has_cache = !stored_channels.isEmpty();
+    const QString stored = stored_channels.join("+");
+    const QString live = live_channels.isEmpty() ? "--" : live_channels.join("+");
+
+    // Toggling never starts I/O. A missing cache must be loaded explicitly.
+    // If a first reload failed, allow toggling the error view back to LIVE.
+    toggleButton->setEnabled(!s.busy && (has_cache || s.enabled));
+    toggleButton->setChecked(s.enabled);
+    reloadButton->setEnabled(stopped && !s.busy);
+    reloadButton->setToolTip(stopped ? "RAW-Snapshot neu vom Oszilloskop laden"
+                                      : "RAW laden nur bei STOP moeglich");
+
+    if(s.busy)
+    {
+      if(!loadWasBusy || activeGeneration != s.generation)
+      {
+        loadTimer.start();
+        loadWasBusy = true;
+        activeGeneration = s.generation;
+        activeExpectedBytes = 0;
+        lastEstimatedPercent = 2; // visible movement from the first refresh
+        progressBar->setValue(lastEstimatedPercent);
+      }
+      if(s.progress_total > 0)
+        activeExpectedBytes = s.progress_total;
+
+      // Default for the FIRST load: 6 seconds per 280k points.
+      // Subsequent successful loads teach us an observed duration/byte.
+      // This is only a visual ETA; actual completion is always authoritative.
+      const qint64 sizeForEstimate = activeExpectedBytes > 0
+          ? activeExpectedBytes : 280000;
+      qint64 expectedMs = (learnedMs > 0 && learnedBytes > 0)
+          ? (learnedMs * sizeForEstimate / learnedBytes)
+          : (6000LL * sizeForEstimate / 280000);
+      expectedMs = std::max<qint64>(1500, std::min<qint64>(120000, expectedMs));
+      const qint64 elapsed = loadTimer.elapsed();
+      // Max 95 % until the worker has published the complete snapshot.
+      const int estimatedPercent = std::min(95, int(95LL * elapsed / expectedMs));
+      lastEstimatedPercent = std::max(lastEstimatedPercent,
+                                      std::max(2, estimatedPercent));
+      statusLabel->hide();
+      progressBar->show();
+      progressBar->setValue(lastEstimatedPercent);
+      return;
+    }
+
+    if(loadWasBusy)
+    {
+      const qint64 measuredMs = loadTimer.elapsed();
+      if(activeGeneration == s.generation && !s.load_failed && s.complete &&
+         activeExpectedBytes > 0 && measuredMs > 0)
+      {
+        // Exponentially smoothed estimate, corrected for transfer size.
+        // Keep learned cost per point independent of CH1/CH2 count.
+        if(learnedMs > 0 && learnedBytes > 0)
+        {
+          qint64 previousScaled = learnedMs * activeExpectedBytes / learnedBytes;
+          learnedMs = (previousScaled * 2 + measuredMs) / 3;
+        }
+        else learnedMs = measuredMs;
+        learnedBytes = activeExpectedBytes;
+        progressBar->setValue(100);
+      }
+      loadWasBusy = false;
+      lastEstimatedPercent = 0;
+    }
+    progressBar->hide();
+    statusLabel->show();
+    QString message;
+    QString tooltip;
+    QString color = "#babfc5";
+    if(!s.enabled)
+    {
+      message = QString("LIVE %1 / NORM").arg(live);
+      tooltip = has_cache ? QString("LIVE-Daten. RAW-Snapshot gespeichert: %1. ").arg(stored)
+                          : QString("LIVE-Daten; kein RAW-Snapshot gespeichert. ");
+      tooltip += "Mit RAW nur gespeicherte Daten anzeigen. 'RAW laden' liest bei STOP neu.";
+    }
+    else if(!has_cache)
+    {
+      message = s.load_failed ? "SNAPSHOT: LADEFEHLER" : "SNAPSHOT: KEINE DATEN";
+      color = "#ff8178";
+      tooltip = s.message;
+    }
+    else
+    {
+      message = QString("SNAPSHOT %1 / %2 P/K / %3")
+            .arg(stored).arg(points).arg(ds2_format_seconds(interval));
+      color = "#75f3a4";
+      if(s.stale)
+      {
+        message += " (ALT)";
+        color = "#f2c66c";
+      }
+      if(s.load_failed)
+      {
+        message += " !";
+        color = "#ff8178";
+      }
+      tooltip = QString("Gespeicherte RAW-Aufnahme: %1, %2 Abtastwerte/Kanal, %3 pro Punkt. ")
+            .arg(stored).arg(points).arg(ds2_format_seconds(interval));
+      tooltip += "Keine Live-Aktualisierung. Neu laden nur mit 'RAW laden' bei STOP.";
+      if(s.stale) tooltip += " Die Aufnahme ist ALT (Oszi war seitdem nicht in STOP).";
+      if(s.load_failed) tooltip += QString(" Letztes Nachladen fehlgeschlagen: %1").arg(s.message);
+    }
+    if(statusLabel->text() != message) statusLabel->setText(message);
+    statusLabel->setToolTip(tooltip);
+    statusLabel->setStyleSheet(QString("color: %1; background: transparent; font-size: 11px;").arg(color));
+    toggleButton->setToolTip(s.enabled
+        ? QString("SNAPSHOT sichtbar (%1). Klick: NORM/LIVE").arg(stored)
+        : (has_cache ? QString("RAW-Snapshot %1 anzeigen (ohne Download)").arg(stored)
+                     : "Noch kein RAW-Snapshot. Erst 'RAW laden' im STOP-Modus."));
+  }
+
+};
+
+class DS2000ZoomFilter : public QObject
+{
+public:
+  explicit DS2000ZoomFilter(QWidget *owner) : QObject(owner), view(owner), dragging(false), last_x(0) {}
+
+protected:
+  bool eventFilter(QObject *watched, QEvent *event) override
+  {
+    if(watched != view || !view->property("ds2_zoom_enabled").toBool())
+      return QObject::eventFilter(watched, event);
+
+    const int border = view->property("ds2_zoom_border").toInt();
+    const int plot_width = view->width() - 2 * border;
+    const int plot_height = view->height() - 2 * border;
+    if(plot_width <= 0 || plot_height <= 0)
+      return QObject::eventFilter(watched, event);
+
+    // An eingeblendetes Messwertefeld kann an seiner Titelleiste verschoben
+    // oder mit dem kleinen Fensterknopf in ein echtes QDockWidget geloest werden.
+    if(event->type() == QEvent::MouseButtonPress)
+    {
+      QMouseEvent *mouse = static_cast<QMouseEvent *>(event);
+      const QRect overlay = view->property("ds2_measure_overlay_rect").toRect();
+      if(mouse->button() == Qt::LeftButton && overlay.isValid() &&
+         overlay.contains(mouse->pos()) &&
+         !view->property("ds2_measure_in_dock").toBool())
+      {
+        const QRect popout = view->property("ds2_measure_popout_rect").toRect();
+        if(popout.contains(mouse->pos()))
+        {
+          openMeasurementDock();
+          mouse->accept();
+          return true;
+        }
+        // Title bar: drag panel without interfering with X/Y cursors.
+        if(mouse->y() < overlay.top() + 22)
+        {
+          moving_overlay = true;
+          last_overlay_pos = mouse->pos();
+          view->setCursor(Qt::SizeAllCursor);
+        }
+        mouse->accept();
+        return true;
+      }
+    }
+    if(event->type() == QEvent::MouseMove && moving_overlay)
+    {
+      QMouseEvent *mouse = static_cast<QMouseEvent *>(event);
+      if(!(mouse->buttons() & Qt::LeftButton))
+      {
+        moving_overlay = false;
+        view->unsetCursor();
+        return false;
+      }
+      const QPoint delta = mouse->pos() - last_overlay_pos;
+      last_overlay_pos = mouse->pos();
+      QPoint p = view->property("ds2_measure_overlay_pos").toPoint() + delta;
+      const QRect box = view->property("ds2_measure_overlay_rect").toRect();
+      p.setX(std::max(0, std::min(plot_width - box.width(), p.x())));
+      p.setY(std::max(0, std::min(plot_height - box.height(), p.y())));
+      view->setProperty("ds2_measure_overlay_pos", p);
+      view->update();
+      mouse->accept();
+      return true;
+    }
+    if(event->type() == QEvent::MouseButtonRelease && moving_overlay)
+    {
+      QMouseEvent *mouse = static_cast<QMouseEvent *>(event);
+      if(mouse->button() == Qt::LeftButton)
+      {
+        moving_overlay = false;
+        view->unsetCursor();
+        mouse->accept();
+        return true;
+      }
+    }
+
+    // Cursor dragging: keep existing trigger/voltage arrows and pan gestures.
+    // Time cursor lines are selected near X, voltage cursor lines near Y.
+    const bool time_active = view->property("ds2_cursor_interactive").toBool() &&
+                             view->property("ds2_cursor_inited").toBool();
+    const bool volt_active = view->property("ds2_y_cursor_interactive").toBool() &&
+                             view->property("ds2_y_cursor_inited").toBool();
+    if(time_active || volt_active)
+    {
+      if(event->type() == QEvent::MouseButtonPress)
+      {
+        QMouseEvent *mouse = static_cast<QMouseEvent *>(event);
+        if(mouse->button() == Qt::LeftButton &&
+           !(mouse->modifiers() & Qt::ShiftModifier) &&
+           inPlot(mouse->pos(), border, plot_width, plot_height))
+        {
+          int chosen = 0;
+          double best = 13.0;
+          const double x = mouse->x() - border;
+          const double y = mouse->y() - border;
+
+          // YA/YB handles occupy x=14..44 relative to the plot origin.
+          // Give the handles priority when an X cursor crosses a Y cursor.
+          // The V2 hit test started at x=45 and therefore excluded them!
+          if(volt_active && x >= 12.0 && x <= 48.0)
+          {
+            const double da = std::fabs(y - cursorPlotY("ds2_y_cursor_a_volt", plot_height));
+            const double db = std::fabs(y - cursorPlotY("ds2_y_cursor_b_volt", plot_height));
+            if(std::min(da, db) <= 12.0)
+            {
+              chosen = (da <= db) ? 3 : 4;
+            }
+          }
+
+          // Otherwise choose the nearest visible cursor line.
+          // Original trigger/channel marker controls remain outside plot.
+          if(!chosen && time_active && x >= 12 && x < plot_width - 12 &&
+             y >= 36 && y < plot_height - 12)
+          {
+            const double da = std::fabs(x - cursorPlotX("ds2_cursor_a_time", plot_width));
+            const double db = std::fabs(x - cursorPlotX("ds2_cursor_b_time", plot_width));
+            if(da <= 11.0 && da < best) { best = da; chosen = 1; }
+            if(db <= 11.0 && db < best) { best = db; chosen = 2; }
+          }
+          if(!chosen && volt_active && x >= 10 && x < plot_width - 10 &&
+             y >= 0 && y < plot_height)
+          {
+            const double da = std::fabs(y - cursorPlotY("ds2_y_cursor_a_volt", plot_height));
+            const double db = std::fabs(y - cursorPlotY("ds2_y_cursor_b_volt", plot_height));
+            if(da <= 12.0 && da < best) { best = da; chosen = 3; }
+            if(db <= 12.0 && db < best) { chosen = 4; }
+          }
+          if(chosen)
+          {
+            moving_cursor = chosen;
+            view->setCursor(chosen <= 2 ? Qt::SizeHorCursor : Qt::SizeVerCursor);
+            mouse->accept();
+            return true;
+          }
+        }
+      }
+      if(event->type() == QEvent::MouseMove && moving_cursor)
+      {
+        QMouseEvent *mouse = static_cast<QMouseEvent *>(event);
+        if(!(mouse->buttons() & Qt::LeftButton))
+        {
+          moving_cursor = 0;
+          view->unsetCursor();
+          return false;
+        }
+        if(moving_cursor <= 2)
+        {
+          const double px = std::max(0.0, std::min(double(plot_width),
+                                           double(mouse->x() - border)));
+          view->setProperty(moving_cursor == 1 ? "ds2_cursor_a_time" : "ds2_cursor_b_time",
+                            plotTimeAtX(px, plot_width));
+        }
+        else
+        {
+          const double py = std::max(0.0, std::min(double(plot_height),
+                                           double(mouse->y() - border)));
+          view->setProperty(moving_cursor == 3 ? "ds2_y_cursor_a_volt" : "ds2_y_cursor_b_volt",
+                            plotVoltageAtY(py, plot_height));
+        }
+        view->update();
+        mouse->accept();
+        return true;
+      }
+      if(event->type() == QEvent::MouseButtonRelease && moving_cursor)
+      {
+        QMouseEvent *mouse = static_cast<QMouseEvent *>(event);
+        if(mouse->button() == Qt::LeftButton)
+        {
+          moving_cursor = 0;
+          view->unsetCursor();
+          mouse->accept();
+          return true;
+        }
+      }
+    }
+
+    if(event->type() == QEvent::Wheel)
+    {
+      QWheelEvent *wheel = static_cast<QWheelEvent *>(event);
+#if QT_VERSION >= QT_VERSION_CHECK(5, 14, 0)
+      const QPoint p = wheel->position().toPoint();
+#else
+      const QPoint p = wheel->pos();
+#endif
+      if(!inPlot(p, border, plot_width, plot_height))
+        return QObject::eventFilter(watched, event);
+      // Accumulate sub-notch wheel movements (some Windows mice/trackpads
+      // report angle deltas smaller than the conventional 120 per detent).
+      wheel_remainder += wheel->angleDelta().y();
+      const int notches = wheel_remainder / 120;
+      wheel_remainder -= notches * 120;
+      if(notches == 0) { wheel->accept(); return true; }
+
+      const double base_time = view->property("ds2_base_time_per_div").toDouble();
+      if(!(base_time > 0.0) || !std::isfinite(base_time))
+        return QObject::eventFilter(watched, event);
+
+      // The 1400-point NORM trace keeps its familiar 16x limit.
+      // A completed RAW snapshot can be inspected down to individual
+      // acquisition samples; allow the additional 1-2-5 steps for RAW only.
+      bool raw_ready = false;
+      const DS2RawSnapshot raw_capture = ds2_raw_snapshot();
+      if(raw_capture.enabled && !raw_capture.busy)
+      {
+        for(int channel = 0; channel < 4; ++channel)
+        {
+          if(raw_capture.traces[channel].valid())
+          {
+            raw_ready = true;
+            break;
+          }
+        }
+      }
+      const double max_zoom = raw_ready ? 2048.0 : 16.0;
+
+      const double old_zoom = factor();
+      double new_zoom = old_zoom;
+      const bool finer = notches > 0;
+      for(int step = 0; step < std::abs(notches); ++step)
+      {
+        const double now_time = base_time / new_zoom;
+        double next_time = ds2_adjacent_time_per_div(now_time, finer);
+        // Keep exactly the original 1-2-5 steps; the allowed range
+        // depends on whether a captured RAW waveform is available.
+        if(!finer && next_time >= base_time) next_time = base_time;
+        if(finer && next_time < base_time / max_zoom * (1.0 - 1e-9)) break;
+        if(!(next_time > 0.0)) break;
+        new_zoom = base_time / next_time;
+        if(new_zoom < 1.0) new_zoom = 1.0;
+        if(new_zoom > max_zoom) new_zoom = max_zoom;
+      }
+
+      const double cursor = (p.x() - border) / static_cast<double>(plot_width);
+      const double original_point = center() + (cursor - 0.5) / old_zoom;
+      const double new_center = original_point - (cursor - 0.5) / new_zoom;
+      setZoom(new_zoom, new_center);
+      wheel->accept();
+      return true;
+    }
+
+    if(event->type() == QEvent::MouseButtonDblClick)
+    {
+      QMouseEvent *mouse = static_cast<QMouseEvent *>(event);
+      if(mouse->button() == Qt::LeftButton && factor() > 1.0 &&
+         inPlot(mouse->pos(), border, plot_width, plot_height))
+      {
+        setZoom(1.0, 0.5);
+        mouse->accept();
+        return true;
+      }
+    }
+
+    if(event->type() == QEvent::MouseButtonPress)
+    {
+      QMouseEvent *mouse = static_cast<QMouseEvent *>(event);
+      // Middle mouse drag is the preferred pan gesture. Shift + left drag
+      // remains available for users without a clickable scroll wheel.
+      const bool middle_pan = (mouse->button() == Qt::MiddleButton) &&
+                              inPlot(mouse->pos(), border, plot_width, plot_height);
+      const bool shift_left_pan = (mouse->button() == Qt::LeftButton) &&
+                                  (mouse->modifiers() & Qt::ShiftModifier) &&
+                                  mouse->x() >= border + 24 &&
+                                  mouse->x() < border + plot_width - 24 &&
+                                  mouse->y() >= border + 26 &&
+                                  mouse->y() < border + plot_height - 24;
+      if(factor() > 1.0 && (middle_pan || shift_left_pan))
+      {
+        dragging = true;
+        drag_button = mouse->button();
+        last_x = mouse->x();
+        view->setCursor(Qt::ClosedHandCursor);
+        mouse->accept();
+        return true;
+      }
+    }
+
+    if(event->type() == QEvent::MouseMove && dragging)
+    {
+      QMouseEvent *mouse = static_cast<QMouseEvent *>(event);
+      if(!(mouse->buttons() & drag_button))
+      {
+        dragging = false;
+        view->unsetCursor();
+        return false;
+      }
+      const int dx = mouse->x() - last_x;
+      last_x = mouse->x();
+      setZoom(factor(), center() - dx / (plot_width * factor()));
+      mouse->accept();
+      return true;
+    }
+
+    if(event->type() == QEvent::MouseButtonRelease && dragging)
+    {
+      QMouseEvent *mouse = static_cast<QMouseEvent *>(event);
+      if(mouse->button() == drag_button)
+      {
+        dragging = false;
+        view->unsetCursor();
+        mouse->accept();
+        return true;
+      }
+    }
+
+    return QObject::eventFilter(watched, event);
+  }
+
+private:
+  QWidget *view;
+  bool dragging;
+  Qt::MouseButton drag_button = Qt::NoButton;
+  int last_x;
+  int wheel_remainder = 0;
+  int moving_cursor = 0;  // 1/2 = time A/B, 3/4 = voltage A/B
+  bool moving_overlay = false;
+  QPoint last_overlay_pos;
+  QPointer<QDockWidget> measure_dock;
+  QPointer<QLabel> x_measure_label;
+  QPointer<QLabel> y_measure_label;
+  QPointer<QTimer> measure_refresh;
+
+  void openMeasurementDock()
+  {
+    if(!measure_dock)
+    {
+      QMainWindow *mw = qobject_cast<QMainWindow *>(view->window());
+      if(!mw) return;
+
+      QDockWidget *dock = new QDockWidget(QString::fromUtf8("Cursor-Messwerte"), mw);
+      dock->setObjectName("DSRemote_DS2000_CursorMesswerte");
+      dock->setFeatures(QDockWidget::DockWidgetMovable |
+                        QDockWidget::DockWidgetFloatable |
+                        QDockWidget::DockWidgetClosable);
+      dock->setAllowedAreas(Qt::LeftDockWidgetArea | Qt::RightDockWidgetArea |
+                            Qt::TopDockWidgetArea | Qt::BottomDockWidgetArea);
+
+      QWidget *content = new QWidget(dock);
+      QVBoxLayout *layout = new QVBoxLayout(content);
+      // Compact two-row layout. The former expanding QLabel rows made the
+      // floating window tall and Qt's docking preview unnecessarily high.
+      layout->setContentsMargins(8, 5, 8, 5);
+      layout->setSpacing(2);
+      QLabel *x = new QLabel(content);
+      QLabel *y = new QLabel(content);
+      // Values can still be selected and copied with the mouse.
+      x->setTextInteractionFlags(Qt::TextSelectableByMouse);
+      y->setTextInteractionFlags(Qt::TextSelectableByMouse);
+      x->setWordWrap(false);
+      y->setWordWrap(false);
+      QFont f("Consolas", 11);
+      f.setBold(true);
+      x->setFont(f);
+      y->setFont(f);
+      const int line_height = QFontMetrics(f).height() + 4;
+      x->setFixedHeight(line_height);
+      y->setFixedHeight(line_height);
+      layout->addWidget(x);
+      layout->addWidget(y);
+      content->setMinimumWidth(515);
+      content->setFixedHeight(10 + 2 * line_height + 2);
+      content->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Fixed);
+      dock->setWidget(content);
+      mw->addDockWidget(Qt::RightDockWidgetArea, dock);
+      // Qt's stock dock title bar already supports double-click to
+      // switch between floating and docked mode (like the control panel).
+      dock->setFloating(true);
+      dock->resize(550, 88);
+      measure_dock = dock;
+      x_measure_label = x;
+      y_measure_label = y;
+
+      connect(dock, &QDockWidget::visibilityChanged, this, [this](bool visible) {
+        if(!visible)
+        {
+          // A float/re-dock transition can emit a temporary 'hidden'.
+          QTimer::singleShot(0, this, [this]() {
+            if(measure_dock && !measure_dock->isVisible())
+            {
+              view->setProperty("ds2_measure_in_dock", false);
+              view->update();
+            }
+          });
+        }
+      });
+      QTimer *timer = new QTimer(this);
+      measure_refresh = timer;
+      timer->setInterval(100);
+      connect(timer, &QTimer::timeout, this, [this]() {
+        if(!measure_dock || !measure_dock->isVisible()) return;
+        if(x_measure_label)
+        {
+          QString s = view->property("ds2_measure_x_text").toString();
+          if(s.isEmpty()) s = QString::fromUtf8("Zeitcursor: aus");
+          if(x_measure_label->text() != s) x_measure_label->setText(s);
+        }
+        if(y_measure_label)
+        {
+          QString s = view->property("ds2_measure_y_text").toString();
+          if(s.isEmpty()) s = QString::fromUtf8("Spannungscursor: aus");
+          if(y_measure_label->text() != s) y_measure_label->setText(s);
+        }
+      });
+      timer->start();
+    }
+
+    measure_dock->setFloating(true);
+    measure_dock->show();
+    measure_dock->raise();
+    view->setProperty("ds2_measure_in_dock", true);
+    view->update();
+  }
+
+  // Inverse of SignalCurve's actual X mapping (including display-only zoom).
+  // The time coordinate is relative to the physical trigger (t=0).
+  double plotTimeAtX(double x, int w) const
+  {
+    const double scale = view->property("ds2_base_time_per_div").toDouble();
+    const double divisions = view->property("ds2_cursor_divisions").toDouble();
+    const double offset = view->property("ds2_cursor_offset").toDouble();
+    const double base_x = (x - w / 2.0) / factor() + center() * w;
+    return offset + (base_x / w - 0.5) * divisions * scale;
+  }
+  double cursorPlotX(const char *key, int w) const
+  {
+    const double scale = view->property("ds2_base_time_per_div").toDouble();
+    const double divisions = view->property("ds2_cursor_divisions").toDouble();
+    if(!(scale > 0.0) || !(divisions > 0.0)) return -1e9;
+    const double offset = view->property("ds2_cursor_offset").toDouble();
+    const double t = view->property(key).toDouble();
+    const double base_x = w * (0.5 + (t - offset) / (divisions * scale));
+    return (base_x - center() * w) * factor() + w / 2.0;
+  }
+
+  // Voltage is referred to CHn's zero-voltage position, not to a pixel.
+  // These equations are the inverse of SignalCurve's existing channel mapping:
+  // y = h/2 - (voltage + chanoffset) * h / (Vdiv * divisions).
+  double plotVoltageAtY(double y, int h) const
+  {
+    const double scale = view->property("ds2_y_cursor_scale").toDouble();
+    const double divisions = view->property("ds2_y_cursor_divisions").toDouble();
+    const double offset = view->property("ds2_y_cursor_offset").toDouble();
+    if(!(scale > 0.0) || !(divisions > 0.0)) return 0.0;
+    return (0.5 - y / h) * scale * divisions - offset;
+  }
+  double cursorPlotY(const char *key, int h) const
+  {
+    const double scale = view->property("ds2_y_cursor_scale").toDouble();
+    const double divisions = view->property("ds2_y_cursor_divisions").toDouble();
+    if(!(scale > 0.0) || !(divisions > 0.0)) return -1e9;
+    const double offset = view->property("ds2_y_cursor_offset").toDouble();
+    const double volts = view->property(key).toDouble();
+    return h * (0.5 - (volts + offset) / (scale * divisions));
+  }
+
+  static bool inPlot(const QPoint &p, int b, int w, int h)
+  {
+    return p.x() >= b && p.x() < b+w && p.y() >= b && p.y() < b+h;
+  }
+  double factor() const
+  {
+    const double z = view->property("ds2_zoom_factor").toDouble();
+    return z >= 1.0 ? z : 1.0;
+  }
+  double center() const
+  {
+    return view->property("ds2_zoom_center").toDouble();
+  }
+  void setZoom(double z, double c)
+  {
+    if(z <= 1.0) { z = 1.0; c = 0.5; }
+    const double half = 0.5 / z;
+    if(c < half) c = half;
+    if(c > 1.0-half) c = 1.0-half;
+    view->setProperty("ds2_zoom_factor", z);
+    view->setProperty("ds2_zoom_center", c);
+    view->update();
+  }
+};
+
+// Draw a captured STOP/RAW trace in the existing time and voltage system.
+// Overview: min/max envelope for every pixel column (keeps narrow spikes).
+// Zoom: genuine sample-to-sample vectors or dots; no invented interpolation.
+static void ds2_draw_raw_trace(QPainter *painter, const DS2RawTrace &t,
+                               int width, int height, double offset, double secdiv,
+                               int hdiv, double chan_vdiv, double chan_offset,
+                               int vdiv, double zoom, double zoom_center,
+                               bool dots)
+{
+  if(!t.valid() || width <= 2 || height <= 2 ||
+     secdiv <= 0.0 || hdiv <= 0 || chan_vdiv <= 0.0 || vdiv <= 0) return;
+  const double span = hdiv * secdiv;
+  const double visible_span = span / zoom;
+  const double time_left = offset + (zoom_center - 0.5 - 0.5/zoom) * span;
+  const double dt = t.xincrement;
+  const int count = t.bytes.size();
+  auto index_at_time = [&](double seconds) -> double {
+    return t.xreference + (seconds - t.xorigin) / dt - (t.first_point - 1);
+  };
+  const int begin = std::max(0, std::min(count-1, int(std::floor(index_at_time(time_left))) - 2));
+  const int end = std::max(0, std::min(count-1,
+             int(std::ceil(index_at_time(time_left + visible_span))) + 2));
+  if(end < begin || index_at_time(time_left + visible_span) < 0 ||
+     index_at_time(time_left) > count-1) return;
+
+  const double fullscale = chan_vdiv * vdiv;
+  auto y_at = [&](int i) -> double {
+    const double volts = (double(t.bytes[i]) - t.yorigin - t.yreference) * t.yincrement;
+    return height * (0.5 - (volts + chan_offset) / fullscale);
+  };
+  const double pixels_per_sample = width * dt / visible_span;
+  if(pixels_per_sample >= 0.75)
+  {
+    double last_x = 0.0, last_y = 0.0;
+    bool have_previous = false;
+    for(int i = begin; i <= end; ++i)
+    {
+      const double sample_t = t.xorigin + ((i + t.first_point-1) - t.xreference) * dt;
+      const double x = (sample_t - time_left) * width / visible_span;
+      const double y = y_at(i);
+      if(dots)
+        painter->drawPoint(QPointF(x, y));
+      else if(have_previous)
+        painter->drawLine(QPointF(last_x, last_y), QPointF(x, y));
+      last_x = x; last_y = y;
+      have_previous = true;
+    }
+    return;
+  }
+
+  // Aggregate by columns, not by skipping samples: spikes cannot disappear.
+  double prev_y = 0.0;
+  bool prev_valid = false;
+  for(int x = 0; x < width; ++x)
+  {
+    const double x0 = time_left + (double(x) / width) * visible_span;
+    const double x1 = time_left + (double(x+1) / width) * visible_span;
+    const int a = std::max(0, int(std::floor(index_at_time(x0))));
+    const int b = std::min(count-1, int(std::ceil(index_at_time(x1))));
+    if(b < a) { prev_valid = false; continue; }
+    quint8 lo = 255, hi = 0;
+    for(int i = a; i <= b; ++i)
+    {
+      lo = std::min(lo, t.bytes[i]);
+      hi = std::max(hi, t.bytes[i]);
+    }
+    // Y coordinates run opposite to ADC voltage.
+    const double y_hi = height * (0.5 -
+        (((double(hi) - t.yorigin - t.yreference) * t.yincrement) + chan_offset)/fullscale);
+    const double y_lo = height * (0.5 -
+        (((double(lo) - t.yorigin - t.yreference) * t.yincrement) + chan_offset)/fullscale);
+    painter->drawLine(QPointF(x+0.5, y_hi), QPointF(x+0.5, y_lo));
+    const double mid = (y_lo + y_hi) * 0.5;
+    if(prev_valid)
+      painter->drawLine(QPointF(x-0.5, prev_y), QPointF(x+0.5, mid));
+    prev_y = mid;
+    prev_valid = true;
+  }
+}
+
+} // namespace
+
 
 
 
@@ -65,6 +977,89 @@ SignalCurve::SignalCurve(QWidget *w_parent) : QWidget(w_parent)
 
   bufsize = 0;
   bordersize = 60;
+
+  // Keep normal scope controls intact. Only the waveform area uses this filter.
+  setProperty("ds2_zoom_enabled", false);
+  setProperty("ds2_zoom_border", bordersize);
+  setProperty("ds2_zoom_factor", 1.0);
+  setProperty("ds2_zoom_center", 0.5);
+  setProperty("ds2_cursor_enabled", false);
+  setProperty("ds2_cursor_interactive", false);
+  setProperty("ds2_cursor_inited", false);
+  setProperty("ds2_cursor_a_time", 0.0);
+  setProperty("ds2_cursor_b_time", 0.0);
+  setProperty("ds2_cursor_offset", 0.0);
+  setProperty("ds2_cursor_divisions", 14.0);
+  setProperty("ds2_y_cursor_enabled", false);
+  setProperty("ds2_y_cursor_interactive", false);
+  setProperty("ds2_y_cursor_inited", false);
+  setProperty("ds2_y_cursor_a_volt", 0.0);
+  setProperty("ds2_y_cursor_b_volt", 0.0);
+  setProperty("ds2_y_cursor_offset", 0.0);
+  setProperty("ds2_y_cursor_scale", 1.0);
+  setProperty("ds2_y_cursor_divisions", 8.0);
+  setProperty("ds2_y_cursor_channel", -1);
+  setProperty("ds2_measure_in_dock", false);
+  setProperty("ds2_measure_overlay_pos", QPoint(8, 7));
+  setProperty("ds2_measure_overlay_rect", QRect());
+  setProperty("ds2_measure_popout_rect", QRect());
+  setProperty("ds2_measure_x_text", QString());
+  setProperty("ds2_measure_y_text", QString());
+  installEventFilter(new DS2000ZoomFilter(this));
+  // DS2302 RAW controls: real Qt buttons in the lower black status strip.
+  // The shortcut and the toggle button share exactly the same behavior.
+  DS2RawControls *raw_controls = new DS2RawControls(this);
+  raw_controls->setGeometry(std::max(0, width()-440), height()-29, 438, 24);
+  auto raw_toggle_requested = [this]() {
+    if(!devparms || devparms->modelserie != 2 || !devparms->connected) return;
+    const DS2RawSnapshot before = ds2_raw_snapshot();
+    bool cached = false;
+    for(int c=0; c<4; ++c) cached |= before.traces[c].valid();
+    if(before.busy) return;
+    if(!before.enabled && !cached)
+    {
+      QToolTip::showText(QCursor::pos(),
+                         "Kein RAW-Snapshot vorhanden. Bitte bei STOP 'RAW laden' klicken.");
+      return;
+    }
+    const bool leaving_raw = before.enabled;
+    ds2_raw_toggle();
+    if(leaving_raw && property("ds2_zoom_factor").toDouble() > 16.0)
+    {
+      setProperty("ds2_zoom_factor", 1.0);
+      setProperty("ds2_zoom_center", 0.5);
+    }
+    update();
+  };
+  QShortcut *raw_shortcut = new QShortcut(QKeySequence("Ctrl+Shift+R"), this);
+  raw_shortcut->setContext(Qt::WindowShortcut);
+  connect(raw_shortcut, &QShortcut::activated, this, raw_toggle_requested);
+  connect(raw_controls->toggleButton, &QToolButton::clicked, this, raw_toggle_requested);
+  connect(raw_controls->reloadButton, &QToolButton::clicked, this, [this]() {
+    if(!devparms || devparms->modelserie != 2 || !devparms->connected) return;
+    // UI check AND worker check; no new acquisition in RUN.
+    if(devparms->triggerstatus != 5)
+    {
+      QToolTip::showText(QCursor::pos(), "RAW laden nur bei STOP.");
+      return;
+    }
+    ds2_raw_reload();
+    update();
+  });
+  QTimer *raw_ui_timer = new QTimer(this);
+  raw_ui_timer->setInterval(120);
+  connect(raw_ui_timer, &QTimer::timeout, this, [this, raw_controls]() {
+    if(devparms)
+    {
+      unsigned live_mask = 0;
+      for(int ch = 0; ch < devparms->channel_cnt && ch < 4; ++ch)
+        if(devparms->chandisplay[ch]) live_mask |= (1u << ch);
+      raw_controls->refresh(devparms->modelserie == 2,
+                            devparms->connected, devparms->triggerstatus == 5,
+                            live_mask);
+    }
+  });
+  raw_ui_timer->start();
 
   v_sense = 1;
 
@@ -128,6 +1123,18 @@ void SignalCurve::clear()
 void SignalCurve::resizeEvent(QResizeEvent *resize_event)
 {
   QWidget::resizeEvent(resize_event);
+  QWidget *found_panel = findChild<QWidget *>("DS2302RawControls");
+  DS2RawControls *panel = static_cast<DS2RawControls *>(found_panel);
+  if(panel)
+  {
+    const int left_reserved = 265; // original CH1/CH2 label region
+    const int usable = std::max(0, width() - left_reserved - 10);
+    const int bar_width = std::min(438, usable);
+    panel->setGeometry(width() - bar_width - 5,
+                       height() - 29, bar_width, 24);
+    panel->setVisible(bar_width >= 250 && devparms &&
+                      devparms->connected && devparms->modelserie == 2);
+  }
 }
 
 
@@ -159,7 +1166,7 @@ void SignalCurve::paintEvent(QPaintEvent *)
 
 void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
 {
-  int i, chn, tmp, rot=1, small_rulers, curve_w_backup, curve_h_backup, w_trace_offset,
+  int i, chn, small_rulers, curve_w_backup, curve_h_backup, w_trace_offset,
       chns_done;
 
   char str[1024];
@@ -174,6 +1181,13 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
   {
     return;
   }
+
+  const DS2RawSnapshot ds2_raw_state_local = (devparms->modelserie == 2)
+                                             ? ds2_raw_snapshot() : DS2RawSnapshot();
+  // Snapshot is an all-or-nothing display source, not a channel-by-channel
+  // fallback to live NORM. A missing snapshot trace is NEVER drawn as live.
+  const bool ds2_snapshot_mode = (devparms->modelserie == 2 &&
+                                  ds2_raw_state_local.enabled);
 
   curve_w_backup = curve_w;
 
@@ -192,49 +1206,21 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
 
   drawTopLabels(painter);
 
-  if((devparms->acquirememdepth > 1000) && !devparms->timebasedelayenable)
-  {
-    tmp = 405 - ((devparms->timebaseoffset / (devparms->acquirememdepth / devparms->samplerate)) * 233);
-  }
-  else
-  {
-    tmp = 405 - ((devparms->timebaseoffset / ((double)devparms->timebasescale * (double)devparms->hordivisions)) * 233);
-  }
-
-  if(tmp < 289)
-  {
-    tmp = 284;
-
-    rot = 2;
-  }
-  else if(tmp > 521)
-    {
-      tmp = 526;
-
-      rot = 0;
-    }
-
-  if((rot == 0) || (rot == 2))
-  {
-    drawSmallTriggerArrow(painter, tmp, 11, rot, QColor(255, 128, 0));
-  }
-  else
-  {
-    drawSmallTriggerArrow(painter, tmp, 16, rot, QColor(255, 128, 0));
-  }
-
-  painter->fillRect(0, curve_h - 30, curve_w, curve_h, QColor(32, 32, 32));
-
-  for(i=0; i<devparms->channel_cnt; i++)
+  // Restore the original bottom strip and the interactive CH1/CH2
+  // channel-setting labels. They were accidentally lost in the RAW-UI
+  // refactor, even though drawChanLabel() was still intact.
+  painter->fillRect(0, curve_h - 30, curve_w, 30, QColor(32, 32, 32));
+  for(i = 0; i < devparms->channel_cnt; ++i)
   {
     drawChanLabel(painter, 8 + (i * 130), curve_h - 25, i);
   }
-
   if(devparms->connected && devparms->show_fps)
   {
     drawfpsLabel(painter, curve_w - 80, curve_h - 11);
   }
 
+  // RAW controls occupy the FREE area to the right of CH1/CH2.
+  // The top Rigol status row stays unchanged.
 /////////////////////////////////// translate coordinates, draw and fill a rectangle ///////////////////////////////////////////
 
   painter->translate(bordersize, bordersize);
@@ -242,6 +1228,101 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
   curve_w -= (bordersize * 2);
 
   curve_h -= (bordersize * 2);
+
+  // If a STOP snapshot is invalidated by RUN, do not keep a RAW-only
+  // magnification for the live NORM plot.
+  if(devparms->modelserie == 2 &&
+     property("ds2_zoom_factor").toDouble() > 16.0 &&
+     !ds2_raw_snapshot().enabled)
+  {
+    setProperty("ds2_zoom_factor", 1.0);
+    setProperty("ds2_zoom_center", 0.5);
+  }
+
+  // Original coordinates are retained for all device models and at 1x zoom.
+  const double ds2_zoom = (devparms->modelserie == 2 && !devparms->math_fft)
+                       ? property("ds2_zoom_factor").toDouble() : 1.0;
+  setProperty("ds2_zoom_enabled", devparms->modelserie == 2 && !devparms->math_fft);
+  // Waveform X-positions are based on timebasescale in the existing code.
+  // Use the same basis for the zoom steps and the effective time/div label.
+  setProperty("ds2_base_time_per_div", devparms->timebasescale);
+  setProperty("ds2_cursor_offset", devparms->timebaseoffset);
+  setProperty("ds2_cursor_divisions", devparms->hordivisions);
+  const double ds2_center = property("ds2_zoom_center").toDouble() * curve_w;
+  const bool ds2_cursor_visible = (devparms->modelserie == 2 &&
+      !devparms->math_fft && !devparms->timebasedelayenable &&
+      property("ds2_cursor_enabled").toBool() &&
+      devparms->timebasescale > 0.0 && devparms->hordivisions > 0);
+  setProperty("ds2_cursor_interactive", ds2_cursor_visible);
+
+  // Y cursors belong to a physical channel.  CH1 and CH2 can have very
+  // different V/div or offsets; simply reinterpreting CH1's voltages as CH2
+  // values made both Y lines disappear off screen when CH1 was switched off.
+  // Keep independent absolute voltage levels for each channel and restore
+  // them whenever that channel is selected again.
+  auto ds2_channel_visible = [&](int c) -> bool {
+    if(c < 0 || c >= devparms->channel_cnt || c >= MAX_CHNS) return false;
+    if(ds2_snapshot_mode)
+      return c < 4 && ds2_raw_state_local.traces[c].valid();
+    return devparms->chandisplay[c];
+  };
+  int ds2_y_chn = devparms->activechannel;
+  if(!ds2_channel_visible(ds2_y_chn))
+  {
+    ds2_y_chn = -1;
+    for(int c=0; c<devparms->channel_cnt && c<MAX_CHNS; ++c)
+      if(ds2_channel_visible(c)) { ds2_y_chn = c; break; }
+  }
+  const int ds2_previous_y_chn = property("ds2_y_cursor_channel").toInt();
+  if(ds2_y_chn != ds2_previous_y_chn)
+  {
+    if(ds2_previous_y_chn >= 0 && ds2_previous_y_chn < MAX_CHNS &&
+       property("ds2_y_cursor_inited").toBool())
+    {
+      const QByteArray prefix = QByteArray("ds2_y_ch") + QByteArray::number(ds2_previous_y_chn);
+      setProperty((prefix + "_a").constData(), property("ds2_y_cursor_a_volt"));
+      setProperty((prefix + "_b").constData(), property("ds2_y_cursor_b_volt"));
+      setProperty((prefix + "_valid").constData(), true);
+    }
+
+    if(ds2_y_chn >= 0 && devparms->vertdivisions > 0 &&
+       devparms->chanscale[ds2_y_chn] > 0.0)
+    {
+      const QByteArray prefix = QByteArray("ds2_y_ch") + QByteArray::number(ds2_y_chn);
+      if(property((prefix + "_valid").constData()).toBool())
+      {
+        setProperty("ds2_y_cursor_a_volt", property((prefix + "_a").constData()));
+        setProperty("ds2_y_cursor_b_volt", property((prefix + "_b").constData()));
+      }
+      else
+      {
+        // First selection of this channel: place both handles on screen.
+        const double range = devparms->chanscale[ds2_y_chn] * devparms->vertdivisions;
+        const double offset = devparms->chanoffset[ds2_y_chn];
+        setProperty("ds2_y_cursor_a_volt", 0.15 * range - offset);
+        setProperty("ds2_y_cursor_b_volt", -0.15 * range - offset);
+      }
+      setProperty("ds2_y_cursor_inited", true);
+    }
+    else
+    {
+      setProperty("ds2_y_cursor_inited", false);
+    }
+    setProperty("ds2_y_cursor_channel", ds2_y_chn);
+  }
+
+  const bool ds2_y_cursor_visible = devparms->modelserie == 2 &&
+      !devparms->math_fft && !devparms->timebasedelayenable &&
+      property("ds2_y_cursor_enabled").toBool() &&
+      ds2_y_chn >= 0 && devparms->vertdivisions > 0 &&
+      devparms->chanscale[ds2_y_chn] > 0.0;
+  if(ds2_y_chn >= 0)
+  {
+    setProperty("ds2_y_cursor_scale", devparms->chanscale[ds2_y_chn]);
+    setProperty("ds2_y_cursor_offset", devparms->chanoffset[ds2_y_chn]);
+    setProperty("ds2_y_cursor_divisions", devparms->vertdivisions);
+  }
+  setProperty("ds2_y_cursor_interactive", ds2_y_cursor_visible);
 
   if(devparms->math_fft && devparms->math_fft_split)
   {
@@ -253,6 +1334,9 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
   painter->setPen(RasterColor);
 
   painter->drawRect (0, 0, curve_w - 1, curve_h - 1);
+
+  // Keep the physical graticule fixed (14 visible divisions).
+  // The effective time per visible division is scope_timebase / display_zoom.
 
   if((devparms->math_fft == 0) || (devparms->math_fft_split == 0))
   {
@@ -362,7 +1446,7 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
 
   for(chn=0; chn<devparms->channel_cnt; chn++)
   {
-    if(!devparms->chandisplay[chn])
+    if(!ds2_channel_visible(chn))
     {
       continue;
     }
@@ -403,10 +1487,17 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
 
 /////////////////////////////////// draw the curve ///////////////////////////////////////////
 
-  if(bufsize > 32)
+  if(bufsize > 32 || ds2_snapshot_mode)
   {
     painter->setClipping(true);
     painter->setClipRegion(QRegion(0, 0, curve_w, curve_h), Qt::ReplaceClip);
+
+    // DS2302 / DS2000: subpixel-accurate waveform rendering (test).
+    // Other model series retain their original drawing algorithm.
+    if(devparms->modelserie == 2)
+    {
+      painter->setRenderHint(QPainter::Antialiasing, true);
+    }
 
     h_step = (double)curve_w / (devparms->hordivisions * 100);
 
@@ -423,15 +1514,57 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
         chns_done = 1;
       }
 
-      if(!devparms->chandisplay[chn])
+      if(!ds2_channel_visible(chn))
       {
         continue;
       }
 
-      w_trace_offset = (curve_w / 2.0) - (((devparms->timebaseoffset - devparms->xorigin[chn]) / devparms->timebasescale) * ((double)curve_w / (double)(devparms->hordivisions)));
+      const double w_trace_offset_f = (curve_w / 2.0) - (((devparms->timebaseoffset - devparms->xorigin[chn]) / devparms->timebasescale) * ((double)curve_w / (double)(devparms->hordivisions)));
+      w_trace_offset = w_trace_offset_f;  // Preserves the original integer-based drawing for other models.
 
       painter->setPen(QPen(QBrush(SignalColor[chn], Qt::SolidPattern), tracewidth, Qt::SolidLine, Qt::SquareCap, Qt::BevelJoin));
 
+      // SNAPSHOT mode draws exclusively those channels saved together in
+      // this RAW capture. Never mix a frozen CH1 with live NORM CH2.
+      if(ds2_snapshot_mode)
+      {
+        if(chn >= 0 && chn < 4 && ds2_raw_state_local.traces[chn].valid())
+          ds2_draw_raw_trace(painter, ds2_raw_state_local.traces[chn],
+                             curve_w, curve_h, devparms->timebaseoffset,
+                             devparms->timebasescale, devparms->hordivisions,
+                             devparms->chanscale[chn], devparms->chanoffset[chn],
+                             devparms->vertdivisions, ds2_zoom,
+                             property("ds2_zoom_center").toDouble(),
+                             devparms->displaytype != 0);
+        continue;
+      }
+
+      if(devparms->modelserie == 2)
+      {
+        // Subpixel rendering and display-only zoom; unchanged raw samples.
+        // Both VECT and DOTS work at any window width.
+        for(i=0; i<bufsize; i++)
+        {
+          const double base_x = i * h_step + w_trace_offset_f;
+          const double x = (base_x - ds2_center) * ds2_zoom + curve_w / 2.0;
+          const double y = (devparms->wavebuf[chn][i] * v_sense)
+                         + (curve_h / 2.0) - chan_tmp_y_pixel_offset[chn];
+          if(devparms->displaytype)
+          {
+            painter->drawPoint(QPointF(x, y));
+          }
+          else if(i + 1 < bufsize)
+          {
+            const double next_base_x = (i + 1) * h_step + w_trace_offset_f;
+            const double next_x = (next_base_x - ds2_center) * ds2_zoom + curve_w / 2.0;
+            const double next_y = (devparms->wavebuf[chn][i + 1] * v_sense)
+                                + (curve_h / 2.0) - chan_tmp_y_pixel_offset[chn];
+            painter->drawLine(QPointF(x, y), QPointF(next_x, next_y));
+          }
+        }
+      }
+      else
+      {
       for(i=0; i<bufsize; i++)
       {
         if(bufsize < (curve_w / 2))
@@ -467,9 +1600,24 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
           }
         }
       }
+      }
     }
 
     painter->setClipping(false);
+    if(devparms->modelserie == 2)
+    {
+      painter->setRenderHint(QPainter::Antialiasing, false);
+      if(ds2_zoom > 1.0)
+      {
+        // Distinguish display zoom from the instrument's actual timebase.
+        const double scope_sec_div = devparms->timebasescale;
+        painter->fillRect(curve_w - 208, 8, 200, 23, QColor(0, 0, 0, 210));
+        painter->setPen(Qt::white);
+        painter->drawText(curve_w - 202, 25,
+                 QString("Ansicht: %1")
+                 .arg(ds2_format_time_per_div(scope_sec_div / ds2_zoom)));
+      }
+    }
   }
 
 /////////////////////////////////// draw the decoder ///////////////////////////////////////////
@@ -551,6 +1699,184 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
       }
   }
 
+  // Both measurements feed the shared frame or its detachable dock.
+  // The event filter updates dock labels on a timer, never during painting.
+  setProperty("ds2_measure_x_text", QString());
+  setProperty("ds2_measure_y_text", QString());
+  setProperty("ds2_measure_x_inline", QString());
+  setProperty("ds2_measure_y_inline", QString());
+  setProperty("ds2_measure_overlay_rect", QRect());
+  setProperty("ds2_measure_popout_rect", QRect());
+
+  // DS2000: interactive time cursors, drawn above waveform/grid.
+  // Store time relative to trigger, never X pixel: zoom and pan do not
+  // distort the measured time difference.
+  if(ds2_cursor_visible)
+  {
+    const double sec_div = devparms->timebasescale;
+    const double divisions = devparms->hordivisions;
+    const double offset = devparms->timebaseoffset;
+    const double center_px = property("ds2_zoom_center").toDouble() * curve_w;
+    if(!property("ds2_cursor_inited").toBool())
+    {
+      // Initialize on first activation in the CURRENT visible window.
+      const double x_a = (0.35 * curve_w - curve_w / 2.0) / ds2_zoom + center_px;
+      const double x_b = (0.65 * curve_w - curve_w / 2.0) / ds2_zoom + center_px;
+      setProperty("ds2_cursor_a_time", offset + (x_a / curve_w - 0.5) * divisions * sec_div);
+      setProperty("ds2_cursor_b_time", offset + (x_b / curve_w - 0.5) * divisions * sec_div);
+      setProperty("ds2_cursor_inited", true);
+    }
+
+    const double ta = property("ds2_cursor_a_time").toDouble();
+    const double tb = property("ds2_cursor_b_time").toDouble();
+    const double xa_base = curve_w * (0.5 + (ta - offset) / (divisions * sec_div));
+    const double xb_base = curve_w * (0.5 + (tb - offset) / (divisions * sec_div));
+    const double xa = (xa_base - center_px) * ds2_zoom + curve_w / 2.0;
+    const double xb = (xb_base - center_px) * ds2_zoom + curve_w / 2.0;
+    const QColor color_a(105, 245, 155);
+    const QColor color_b(255, 185, 70);
+
+    painter->save();
+    painter->setClipRect(QRect(0, 0, curve_w, curve_h));
+    painter->setRenderHint(QPainter::Antialiasing, true);
+    if(xa >= 0 && xa < curve_w)
+    {
+      painter->setPen(QPen(color_a, 1.3, Qt::DashLine));
+      painter->drawLine(QPointF(xa, 0), QPointF(xa, curve_h - 1));
+      painter->setPen(QPen(Qt::black));
+      painter->fillRect(QRectF(xa - 11, 35, 22, 20), color_a);
+      painter->drawText(QRectF(xa - 11, 35, 22, 20), Qt::AlignCenter, "A");
+    }
+    if(xb >= 0 && xb < curve_w)
+    {
+      painter->setPen(QPen(color_b, 1.3, Qt::DashLine));
+      painter->drawLine(QPointF(xb, 0), QPointF(xb, curve_h - 1));
+      painter->setPen(QPen(Qt::black));
+      painter->fillRect(QRectF(xb - 11, 35, 22, 20), color_b);
+      painter->drawText(QRectF(xb - 11, 35, 22, 20), Qt::AlignCenter, "B");
+    }
+    painter->restore();
+
+    const QString values = QString::fromUtf8("A: %1   B: %2   \xCE\x94t: %3   1/|\xCE\x94t|: %4")
+            .arg(ds2_format_seconds(ta),
+                 ds2_format_seconds(tb),
+                 ds2_format_seconds(tb - ta),
+                 ds2_format_frequency(std::fabs(tb - ta)));
+    const QString compact = QString::fromUtf8("\xCE\x94t: %1   1/|\xCE\x94t|: %2")
+            .arg(ds2_format_seconds(tb - ta),
+                 ds2_format_frequency(std::fabs(tb - ta)));
+    setProperty("ds2_measure_x_text", values);
+    const QFontMetrics ds2_fm(painter->font());
+    setProperty("ds2_measure_x_inline",
+                ds2_fm.horizontalAdvance(values) + 38 <= curve_w ? values : compact);
+  }
+
+  // DS2000 Y cursors: independently draggable absolute voltage levels.
+  if(ds2_y_cursor_visible)
+  {
+    const double scale = devparms->chanscale[ds2_y_chn];
+    const double offset = devparms->chanoffset[ds2_y_chn];
+    const double divisions = devparms->vertdivisions;
+    if(!property("ds2_y_cursor_inited").toBool())
+    {
+      // On first use, place A/B inside the visible raster.
+      setProperty("ds2_y_cursor_a_volt", (0.5 - 0.35) * scale * divisions - offset);
+      setProperty("ds2_y_cursor_b_volt", (0.5 - 0.65) * scale * divisions - offset);
+      setProperty("ds2_y_cursor_inited", true);
+    }
+    const double va = property("ds2_y_cursor_a_volt").toDouble();
+    const double vb = property("ds2_y_cursor_b_volt").toDouble();
+    const double ya = curve_h * (0.5 - (va + offset) / (scale * divisions));
+    const double yb = curve_h * (0.5 - (vb + offset) / (scale * divisions));
+    const QColor color_a(90, 205, 255);  // blue-cyan to distinguish from time A
+    const QColor color_b(255, 110, 205); // magenta to distinguish from time B
+
+    painter->save();
+    painter->setClipRect(QRect(0, 0, curve_w, curve_h));
+    painter->setRenderHint(QPainter::Antialiasing, true);
+    if(ya >= 0.0 && ya < curve_h)
+    {
+      painter->setPen(QPen(color_a, 1.3, Qt::DashLine));
+      painter->drawLine(QPointF(0, ya), QPointF(curve_w - 1, ya));
+      painter->fillRect(QRectF(14, ya - 10, 30, 20), color_a);
+      painter->setPen(Qt::black);
+      painter->drawText(QRectF(14, ya - 10, 30, 20), Qt::AlignCenter, "YA");
+    }
+    if(yb >= 0.0 && yb < curve_h)
+    {
+      painter->setPen(QPen(color_b, 1.3, Qt::DashLine));
+      painter->drawLine(QPointF(0, yb), QPointF(curve_w - 1, yb));
+      painter->fillRect(QRectF(14, yb - 10, 30, 20), color_b);
+      painter->setPen(Qt::black);
+      painter->drawText(QRectF(14, yb - 10, 30, 20), Qt::AlignCenter, "YB");
+    }
+    painter->restore();
+
+    const QString values = QString("CH%1:  ").arg(ds2_y_chn + 1) +
+      QString::fromUtf8("YA: %1   YB: %2   \xCE\x94V: %3")
+      .arg(ds2_format_volts(va), ds2_format_volts(vb), ds2_format_volts(vb - va));
+    const QString compact = QString("CH%1:  ").arg(ds2_y_chn + 1) +
+      QString::fromUtf8("\xCE\x94V: %1").arg(ds2_format_volts(vb - va));
+    setProperty("ds2_measure_y_text", values);
+    const QFontMetrics ds2_fm(painter->font());
+    setProperty("ds2_measure_y_inline",
+                ds2_fm.horizontalAdvance(values) + 38 <= curve_w ? values : compact);
+  }
+
+  // DS2000: one framed, movable on-screen value panel.
+  // Klick auf [>>] docks into a native QDockWidget (with float/re-dock).
+  if(devparms->modelserie == 2 && !property("ds2_measure_in_dock").toBool() &&
+     (ds2_cursor_visible || ds2_y_cursor_visible))
+  {
+    painter->save();
+    painter->setRenderHint(QPainter::Antialiasing, false);
+    const QString x_text = property("ds2_measure_x_inline").toString();
+    const QString y_text = property("ds2_measure_y_inline").toString();
+    const QFontMetrics fm(painter->font());
+    const int row_height = fm.height() + 7;
+    const int rows = int(!x_text.isEmpty()) + int(!y_text.isEmpty());
+    const int box_h = 25 + rows * row_height + 5;
+    const int text_w = std::max(fm.horizontalAdvance(x_text), fm.horizontalAdvance(y_text));
+    const int box_w = std::min(curve_w - 16, std::max(200, text_w + 24));
+    QPoint pos = property("ds2_measure_overlay_pos").toPoint();
+    pos.setX(std::max(0, std::min(curve_w - box_w, pos.x())));
+    pos.setY(std::max(0, std::min(curve_h - box_h, pos.y())));
+    setProperty("ds2_measure_overlay_pos", pos);
+    const QRect box(pos, QSize(box_w, box_h));
+    const QRect popout(box.right() - 27, box.top() + 3, 23, 19);
+
+    painter->fillRect(box, QColor(10, 17, 23, 232));
+    painter->setPen(QPen(QColor(115, 166, 196), 1));
+    painter->drawRect(box.adjusted(0, 0, -1, -1));
+    painter->fillRect(QRect(box.x() + 1, box.y() + 1, box.width() - 2, 23),
+                      QColor(35, 53, 66, 238));
+    painter->setPen(QColor(220, 231, 240));
+    painter->drawText(QRect(box.x() + 8, box.y() + 3, box.width() - 50, 19),
+                      Qt::AlignVCenter | Qt::AlignLeft,
+                      QString::fromUtf8("Messwerte  (ziehen)"));
+    painter->setPen(QPen(QColor(145, 191, 218), 1));
+    painter->drawRect(popout);
+    painter->setPen(Qt::white);
+    painter->drawText(popout, Qt::AlignCenter, QString::fromUtf8("↗"));
+    int row_y = box.y() + 26;
+    if(!x_text.isEmpty())
+    {
+      painter->setPen(QColor(175, 255, 203));
+      painter->drawText(QRect(box.x() + 10, row_y, box.width() - 18, row_height),
+                        Qt::AlignVCenter | Qt::AlignLeft, x_text);
+      row_y += row_height;
+    }
+    if(!y_text.isEmpty())
+    {
+      painter->setPen(QColor(137, 218, 255));
+      painter->drawText(QRect(box.x() + 10, row_y, box.width() - 18, row_height),
+                        Qt::AlignVCenter | Qt::AlignLeft, y_text);
+    }
+    setProperty("ds2_measure_overlay_rect", box.translated(bordersize, bordersize));
+    setProperty("ds2_measure_popout_rect", popout.translated(bordersize, bordersize));
+    painter->restore();
+  }
+
   if(devparms->countersrc)
   {
     paintCounterLabel(painter, curve_w - 180, 6);
@@ -576,7 +1902,10 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
       paintLabel(painter, curve_w - 110, 5, 100, 20, str, Qt::white);
     }
 
-  if(label_active == LABEL_ACTIVE_TRIG)
+  if(label_active == LABEL_ACTIVE_TRIG &&
+     devparms->triggeredgesource >= 0 &&
+     devparms->triggeredgesource < MAX_CHNS &&
+     devparms->triggeredgesource < devparms->channel_cnt)
   {
     convert_to_metric_suffix(str, devparms->triggeredgelevel[devparms->triggeredgesource], 2, 1024);
 
@@ -896,6 +2225,7 @@ void SignalCurve::drawFFT(QPainter *painter, int curve_h_b, int curve_w_b)
 void SignalCurve::drawCurve(struct device_settings *devp, struct tmcdev *dev)
 {
   devparms = devp;
+  setProperty("ds2_zoom_enabled", devparms && devparms->modelserie == 2);
 
   device = dev;
 
@@ -908,6 +2238,7 @@ void SignalCurve::drawCurve(struct device_settings *devp, struct tmcdev *dev)
 void SignalCurve::setDeviceParameters(struct device_settings *devp)
 {
   devparms = devp;
+  setProperty("ds2_zoom_enabled", devparms && devparms->modelserie == 2);
 }
 
 
@@ -1148,11 +2479,20 @@ void SignalCurve::drawTopLabels(QPainter *painter)
 
   painter->drawText(670, 20, "T");
 
-  convert_to_metric_suffix(str, devparms->triggeredgelevel[devparms->triggeredgesource], 2, 512);
+  if(devparms->triggeredgesource >= 0 &&
+     devparms->triggeredgesource < MAX_CHNS &&
+     devparms->triggeredgesource < devparms->channel_cnt)
+  {
+    convert_to_metric_suffix(str, devparms->triggeredgelevel[devparms->triggeredgesource], 2, 512);
+    strlcat(str, devparms->chanunitstr[devparms->chanunit[devparms->triggeredgesource]], 512);
+  }
+  else
+  {
+    // EXT/EXT5/AC are trigger sources, not indices into chanunit[].
+    strlcpy(str, devparms->triggeredgesource == 6 ? "AC" : "EXT", 512);
+  }
 
-  strlcat(str, devparms->chanunitstr[devparms->chanunit[devparms->triggeredgesource]], 512);
-
-  if(devparms->triggeredgesource < 4)
+  if(devparms->triggeredgesource >= 0 && devparms->triggeredgesource < 4)
   {
     painter->setPen(SignalColor[devparms->triggeredgesource]);
   }
@@ -1624,6 +2964,7 @@ void SignalCurve::setBorderSize(int newsize)
 {
   bordersize = newsize;
   if(bordersize < 0)  bordersize = 0;
+  setProperty("ds2_zoom_border", bordersize);
   update();
 }
 
@@ -1910,7 +3251,9 @@ void SignalCurve::mouseReleaseEvent(QMouseEvent *release_event)
   }
   else if(trig_level_arrow_moving)
     {
-      if(devparms->triggeredgesource > 3)
+      if(devparms->triggeredgesource < 0 ||
+         devparms->triggeredgesource >= MAX_CHNS ||
+         devparms->triggeredgesource >= devparms->channel_cnt)
       {
         return;
       }
@@ -2094,7 +3437,10 @@ void SignalCurve::mouseMoveEvent(QMouseEvent *move_event)
       trig_pos_arrow_pos = w;
     }
   }
-  else if(trig_level_arrow_moving)
+  else if(trig_level_arrow_moving &&
+          devparms->triggeredgesource >= 0 &&
+          devparms->triggeredgesource < MAX_CHNS &&
+          devparms->triggeredgesource < devparms->channel_cnt)
     {
       trig_level_arrow_pos = mouse_y;
 

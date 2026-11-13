@@ -10,6 +10,8 @@ int main(int argc, char *argv[])
 {
   QApplication app(argc, argv);
 
+  qSetMessagePattern("[%{time yyyy-MM-dd hh:mm:ss.zzz}] %{type}: %{message}");
+
 //  app.setAttribute(Qt::AA_DontUseNativeMenuBar);
 
 #if QT_VERSION >= 0x050000

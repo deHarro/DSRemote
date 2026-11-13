@@ -49,6 +49,19 @@ void lan_connect_thread::run()
 }
 
 
+/*void lan_connect_thread::run()
+{
+    msleep(300);
+    if(dev_str[0] == 0) return;
+
+    // Lokale Instanz im Worker-Thread erstellen
+    osclan client;
+    if(client.open(dev_str) == 0) {
+        // Optional: Hier direkt das Oszilloskop initialisieren oder den Zeiger übergeben
+        device = (struct tmcdev*)&client; // (Je nachdem wie tmc_open_lan definiert ist)
+    }
+}
+*/
 struct tmcdev * lan_connect_thread::get_device(void)
 {
 //    qDebug() << "get_device() = " << device;

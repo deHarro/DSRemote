@@ -274,7 +274,8 @@ void UI_Mainwindow::open_connection()
   }
 
   if((devparms.modelserie != 6) &&
-     (devparms.modelserie != 1))
+     (devparms.modelserie != 1) &&
+     (devparms.modelserie != 2))
   {
     msgBox.setIcon(QMessageBox::Warning);
     msgBox.setText("Unsupported device detected.");

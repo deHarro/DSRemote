@@ -1,0 +1,25 @@
+# Laufzeitbibliotheken (Qt, MinGW usw.)
+*.dll
+
+# Lokale Build-Ergebnisse
+*.o
+*.obj
+*.exe
+*.pdb
+
+# Qt Creator Build-Verzeichnisse (Debug und Release)
+/build/
+
+# Temporäre Python-Patchskripte
+*patch*.py
+
+# C++-Sicherungskopien
+*.cpp.bak*
+
+# Manuelle Sicherungen
+*_sicherung*
+*_Sicherung*
+
+# Lokale Qt-Creator-Einstellungen
+/.qtcreator/
+*.pro.user*

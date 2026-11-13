@@ -26,294 +26,167 @@
 */
 
 
-//#include "mainwindow.h"
+/*
+ * DSRemote connection.cpp with bridge-aware LAN handling.
+ * USB path and public function signatures kept intact.
+ */
 #include "connection.h"
 #include "osc_lan.h"
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <QDebug>
 
-#define MAX_CMD_LEN     (255)
-#define MAX_RESP_LEN    (1024 * 1024 * 2)
+#define MAX_CMD_LEN  (255)
+#define MAX_RESP_LEN (1024 * 1024 * 2)
 
-int tmc_connection_type;
+int tmc_connection_type = 0;
+struct tmcdev *tmc_device = nullptr;
+extern osclan *ocs;
 
-struct tmcdev *tmc_device;
-
-struct tmcdev * tmc_open_usb(const char *device)
+struct tmcdev *tmc_open_usb(const char *device)
 {
-  tmc_connection_type = 0;
-
-  tmc_device = tmcdev_open(device);
-
-  return tmc_device;
+    if(tmc_device) tmc_close();
+    tmc_connection_type = 0;
+    tmc_device = tmcdev_open(device);
+    return tmc_device;
 }
 
-
-struct tmcdev * tmc_open_lan(const char *address)
+struct tmcdev *tmc_open_lan(const char *address)
 {
-  tmc_connection_type = 1;
+    if(tmc_device || ocs) tmc_close();
+    tmc_connection_type = 1;
+    ocs = new osclan();
 
-  if(tmc_device) {
-    tmc_close();
-  }
-
-  tmc_device = (struct tmcdev *)calloc(1, sizeof(struct tmcdev));
-  if(tmc_device == nullptr) {
-    return nullptr;
-  }
-
-  tmc_device->hdrbuf = (char *)calloc(1, MAX_RESP_LEN + 1024);
-  if(tmc_device->hdrbuf == nullptr) {
-    free(tmc_device);
-    tmc_device = nullptr;
-    return nullptr;
-  }
-
-  tmc_device->buf = tmc_device->hdrbuf;
-
-  tmc_device->fd = ocs.open(address);
-
-  if(tmc_device->fd < 0)  {
-    free(tmc_device->hdrbuf);
-
-    free(tmc_device);
-
-    tmc_device = nullptr;
-  }
-  return tmc_device;
+    tmc_device = (struct tmcdev *)calloc(1, sizeof(struct tmcdev));
+    if(!tmc_device) { delete ocs; ocs = nullptr; return nullptr; }
+    tmc_device->hdrbuf = (char *)calloc(1, MAX_RESP_LEN + 1024);
+    if(!tmc_device->hdrbuf) {
+        free(tmc_device);
+        tmc_device = nullptr;
+        delete ocs;
+        ocs = nullptr;
+        return nullptr;
+    }
+    tmc_device->buf = tmc_device->hdrbuf;
+    tmc_device->fd = ocs->open(address); // 0 = success, -1 = failure
+    if(tmc_device->fd < 0) {
+        tmc_close();
+        return nullptr;
+    }
+    return tmc_device;
 }
-
 
 void tmc_close(void)
 {
-  if(tmc_connection_type == 0)
-  {
-    tmcdev_close(tmc_device);
-  }
-  else
-  {
-      if(tmc_device != nullptr)
-      {
-
-        ocs.close();
-
-        free(tmc_device->hdrbuf);
-
-        free(tmc_device);
-
-      }
-  }
-  tmc_device = nullptr;
+    if(tmc_connection_type == 0) {
+        if(tmc_device) tmcdev_close(tmc_device);
+    } else {
+        if(ocs) { ocs->close(); delete ocs; ocs = nullptr; }
+        if(tmc_device) {
+            free(tmc_device->hdrbuf);
+            free(tmc_device);
+        }
+    }
+    tmc_device = nullptr;
 }
-
 
 int tmc_write(const char *cmd)
 {
-    int i, n, len, qry=0;
-    char buf[MAX_CMD_LEN + 16];
-    char str[128];
-    qDebug() << "tmc_write:" << cmd;
-    if(tmc_device == nullptr || tmc_device->fd < 0)
-    {
-      qDebug("tmc_lan error: device = Null\n");
-      return -1;
-    }
+    if(!cmd || !tmc_device || tmc_device->fd < 0) return -1;
+    const int len = static_cast<int>(strlen(cmd));
+    if(len < 2 || len > MAX_CMD_LEN) return -1;
+    if(tmc_connection_type == 0) return tmcdev_write(tmc_device, cmd);
+    if(!ocs) return -1;
 
-    len = (int) strlen(cmd);
+    char wire[MAX_CMD_LEN + 2];
+    memcpy(wire, cmd, len);
+    wire[len] = '\n';
+    wire[len + 1] = 0;
+    qDebug("LAN -> %s", cmd);
+    if(ocs->write(wire, len + 1) != len + 1) return -1;
 
-    if(len > MAX_CMD_LEN)
-    {
-      qDebug("tmc_lan error: command too long\n");
-
-      return -1;
-    }
-
-    if(len < 2)
-    {
-      qDebug("tmc_lan error: command too short\n");
-
-      return -1;
-    }
-    if(cmd[len - 1] == '?')
-    {
-      qry = 1;
-    }
-    strlcpy(buf, cmd, sizeof(buf));
-    strlcat(buf, "\n", sizeof(buf));
-#if 0
-    if(!(!strncmp(buf, ":TRIG:STAT?", 11) ||  /* don't print these commands to the console */
-        !strncmp(buf, ":TRIG:SWE?", 10) ||    /* because they are used repeatedly */
-        !strncmp(buf, ":WAV:DATA?", 10) ||
-        !strncmp(buf, ":WAV:MODE NORM", 14) ||
-        !strncmp(buf, ":WAV:FORM BYTE", 14) ||
-        !strncmp(buf, ":WAV:SOUR CHAN", 14) ||
-        !strncmp(buf, ":TRIG:SWE?", 10) ||
-        !strncmp(buf, ":ACQ:SRAT?", 10) ||
-        !strncmp(buf, ":ACQ:MDEP?", 10) ||
-        !strncmp(buf, ":MEAS:COUN:VAL?", 15) ||
-        !strncmp(buf, ":FUNC:WREC:OPER?", 16) ||
-        !strncmp(buf, ":FUNC:WREP:OPER?", 16) ||
-        !strncmp(buf, ":FUNC:WREP:FMAX?", 16) ||
-        !strncmp(buf, ":FUNC:WREC:FMAX?", 16) ||
-        !strncmp(buf, ":FUNC:WREP:FCUR?", 16) ||
-        !strncmp(buf, ":WAV:XOR?", 9)))
-      qDebug("tmc_lan write: %s", buf);
-#endif
-  if(!strncmp(buf, "*RST", 4)) // || (!strncmp(buf, ":AUT", 4)))
-  {
-    qry = 1;
-  }
-
-  if(tmc_connection_type == 0)
-  {
-    return tmcdev_write(tmc_device, cmd);
-  }
-  else
-  {
-
-      //    return tmclan_write(tmc_device, cmd);
-      n = ocs.write(buf, len + 1);
-
-      if(n != (len + 1))
-      {
-        qDebug("tmclan error: device write error");
-
-        return -1;
-      }
-
-      if(!qry)
-      {
-        for(i=0; i<20; i++)
-        {
-          qDebug() << "tmc_write: *OPC?";
-          if(ocs.write("*OPC?\n", 6) != 6)
-          {
-            qDebug("tmclan error: device write error");
-
+    // A query can contain arguments after the '?' (e.g. :MEAS:ITEM? VPP,CHAN1).
+    const bool query = strchr(cmd, '?') != nullptr;
+    const bool reset = strncmp(cmd, "*RST", 4) == 0;
+    if(!query && !reset) {
+        // One *OPC? is enough: this SCPI query itself waits for completion.
+        if(ocs->write("*OPC?\n", 6) != 6) return -1;
+        char reply[128];
+        int n = ocs->readLine(reply, sizeof(reply) - 1);
+        if(n < 0) { qDebug("*OPC? timed out or bridge disconnected"); return -1; }
+        reply[n] = 0;
+        while(n > 0 && (reply[n-1] == '\n' || reply[n-1] == '\r')) reply[--n] = 0;
+        if(strcmp(reply, "1") != 0) {
+            qDebug("Unexpected *OPC? reply: %s", reply);
             return -1;
-          }
-
-          n = ocs.read(str, 128);
-          qDebug() << "ocs.read() = " << n;
-
-          if(n < 0)
-          {
-            qDebug("tmclan error: device read error");
-
-            return -1;
-          }
-
-          if(n == 2)
-          {
-            if(str[0] == '1')
-            {
-              break;
-            }
-          }
-          usleep(25000);
         }
-      }
-
-      return len;
-  }
+    }
+    return len;
 }
 
-void tmc_flush(void) {
-    if(tmc_connection_type && tmc_device != nullptr && tmc_device->fd != 0)
-        ocs.flush();
+void tmc_flush(void)
+{
+    if(tmc_connection_type == 1 && tmc_device && tmc_device->fd >= 0 && ocs)
+        ocs->flush();
 }
 
 int tmc_read(void)
 {
-    int n, size, size2, len;
+    if(!tmc_device || tmc_device->fd < 0) return -1;
+    if(tmc_connection_type == 0) return tmcdev_read(tmc_device);
+    if(!ocs) return -1;
 
-    char blockhdr[32];
-    if(tmc_device == nullptr || tmc_device->fd < 0)
-    {
-      return -1;
+    char *dst = tmc_device->hdrbuf;
+    tmc_device->buf = dst;
+    tmc_device->sz = 0;
+    dst[0] = 0;
+
+    if(ocs->readExact(dst, 1) != 1) return -2;
+    if(dst[0] != '#') {
+        const int rest = ocs->readLine(dst + 1, MAX_RESP_LEN - 1);
+        if(rest <= 0) return -2;
+        int size = rest + 1;
+        while(size > 0 && (dst[size-1] == '\n' || dst[size-1] == '\r')) --size;
+        dst[size] = 0;
+        tmc_device->sz = size;
+        qDebug("LAN <- ASCII (%d bytes): %.120s", size, dst);
+        return size;
     }
 
-  if(tmc_connection_type == 0)
-  {
-    return tmcdev_read(tmc_device);
-  }
-  else
-  {
-
-      tmc_device->hdrbuf[0] = 0;
-
-      tmc_device->sz = 0;
-
-      size = 0;
-
-      while(1)
-      {
-        n = ocs.read(tmc_device->hdrbuf + size, MAX_RESP_LEN - size);
-        qDebug() << "ocs.read() = " << n;
-        if(n < 1)
-        {
-          return -2;
-        }
-
-        size += n;
-
-        if(tmc_device->hdrbuf[size - 1] == '\n')
-        {
-          break;
-        }
-      }
-
-      if((size < 2) || (size > MAX_RESP_LEN))
-      {
-        tmc_device->hdrbuf[0] = 0;
-
-        tmc_device->buf[0] = 0;
-
+    // SCPI definite-length block: #N<exactly N decimal length digits><payload>LF
+    char digits_char;
+    if(ocs->readExact(&digits_char, 1) != 1) return -2;
+    int ndigits = digits_char - '0';
+    if(ndigits < 1 || ndigits > 9) return -3; // #0 unsupported
+    char length_ascii[10] = {};
+    if(ocs->readExact(length_ascii, ndigits) != ndigits) return -2;
+    for(int i = 0; i < ndigits; ++i) {
+        if(length_ascii[i] < '0' || length_ascii[i] > '9') return -3;
+    }
+    const long long count = atoll(length_ascii);
+    if(count < 0 || count > MAX_RESP_LEN) {
+        qDebug("LAN: SCPI block length invalid: %lld", count);
         return -3;
-      }
+    }
+    const int size = static_cast<int>(count);
+    const int header_size = 2 + ndigits;
+    dst[0] = '#';
+    dst[1] = digits_char;
+    memcpy(dst + 2, length_ascii, ndigits);
+    if(ocs->readExact(dst + header_size, size) != size) return -2;
 
-      tmc_device->hdrbuf[size] = 0;
-
-      if(tmc_device->hdrbuf[0] != '#')
-      {
-        if(tmc_device->hdrbuf[size - 1] == '\n')
-        {
-          tmc_device->hdrbuf[--size] = 0;
-        }
-
-        tmc_device->buf = tmc_device->hdrbuf;
-
-        tmc_device->sz = size;
-
-        return tmc_device->sz;
-      }
-
-      strncpy(blockhdr, tmc_device->hdrbuf, 16);
-
-      len = blockhdr[1] - '0';
-
-      if((len < 1) || (len > 9))
-      {
-        blockhdr[31] = 0;
-
-        return -1;
-      }
-
-      blockhdr[len + 2] = 0;
-
-      size2 = atoi(blockhdr + 2);
-
-      size--;  // remove the last character
-
-      if(size < size2)
-      {
-        blockhdr[31] = 0;
-
-        return -1;
-      }
-
-      tmc_device->buf = tmc_device->hdrbuf + len + 2;
-
-      tmc_device->sz = size2;
-
-      return tmc_device->sz;
-  }
+    char end;
+    if(ocs->readExact(&end, 1) != 1) return -2;
+    if(end == '\r') {
+        if(ocs->readExact(&end, 1) != 1) return -2;
+    }
+    if(end != '\n') {
+        qDebug("LAN: missing newline after binary block");
+        return -3;
+    }
+    tmc_device->buf = dst + header_size;
+    tmc_device->sz = size;
+    qDebug("LAN <- binary payload %d bytes", size);
+    return size;
 }

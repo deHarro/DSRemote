@@ -55,6 +55,8 @@
 #include <QTimer>
 #include <cmath>
 #include <algorithm>
+#include <functional>
+#include <vector>
 
 // DS2000 display-only horizontal zoom, independent of the instrument timebase.
 // Event filter avoids changing signalcurve.h or the existing trigger/marker handlers.
@@ -380,10 +382,88 @@ public:
 
 };
 
+// Visual measurement aid. The measurements remain in native seconds/volts;
+// plot coordinates are used only for hit testing and the on-screen marker.
+struct DS2CursorTarget
+{
+  bool valid = false;
+  double x = 0.0;
+  double y = 0.0;
+  double time = 0.0;
+  double voltage = 0.0;
+};
+
+using DS2CursorTargetQuery =
+    std::function<DS2CursorTarget(int, double, double, int, int)>;
+
+// Return the nearest measured crossing of a voltage level in the visible
+// time range. Segments on both sides of the cursor are searched separately:
+// the first valid crossing in each direction is the nearest on that side.
+// For a long RAW trace this normally examines only a small local region.
+// The search is independent of trigger EDGE polarity and time zero.
+template<typename VoltageAt>
+static bool ds2_find_nearest_level_crossing(int count, double firstTime,
+    double dt, double viewLeft, double viewRight, double cursorTime,
+    double level, const VoltageAt &voltageAt, double &resultTime)
+{
+  if(count < 2 || !(dt > 0.0) || !std::isfinite(dt) ||
+     !std::isfinite(firstTime) || !std::isfinite(level) ||
+     !(viewRight > viewLeft)) return false;
+
+  const double lastTime = firstTime + (count - 1) * dt;
+  if(lastTime < viewLeft || firstTime > viewRight) return false;
+
+  // Clamp in floating point BEFORE converting to int. This also avoids
+  // overflow if the scope offset is far outside the acquired record.
+  auto sampleIndex = [&](double t) -> int {
+    const double position = (t - firstTime) / dt;
+    if(!(position > 0.0)) return 0;
+    if(position >= count - 1) return count - 1;
+    return int(std::floor(position));
+  };
+  const int begin = std::max(0, sampleIndex(viewLeft) - 1);
+  const int finish = std::min(count - 2, sampleIndex(viewRight) + 1);
+  if(begin > finish) return false;
+  const int pivot = std::max(begin, std::min(finish, sampleIndex(cursorTime)));
+
+  bool found = false;
+  double bestDistance = 0.0;
+  auto checkSegment = [&](int segment) -> bool {
+    const double v0 = voltageAt(segment);
+    const double v1 = voltageAt(segment + 1);
+    if(!std::isfinite(v0) || !std::isfinite(v1) || v0 == v1)
+      return false; // Flat runs at the threshold are ambiguous.
+    if(!((v0 <= level && v1 >= level) ||
+         (v0 >= level && v1 <= level))) return false;
+    const double fraction = (level - v0) / (v1 - v0);
+    if(fraction < 0.0 || fraction > 1.0) return false;
+    const double t = firstTime + (segment + fraction) * dt;
+    if(t < viewLeft || t > viewRight) return false;
+    const double distance = std::fabs(t - cursorTime);
+    if(!found || distance < bestDistance)
+    {
+      resultTime = t;
+      bestDistance = distance;
+      found = true;
+    }
+    return true;
+  };
+
+  // Stop after the first crossing in either direction; any subsequent one
+  // on that same side would be farther from the X cursor.
+  for(int segment = pivot; segment >= begin; --segment)
+    if(checkSegment(segment)) break;
+  for(int segment = pivot + 1; segment <= finish; ++segment)
+    if(checkSegment(segment)) break;
+  return found;
+}
+
 class DS2000ZoomFilter : public QObject
 {
 public:
-  explicit DS2000ZoomFilter(QWidget *owner) : QObject(owner), view(owner), dragging(false), last_x(0) {}
+  explicit DS2000ZoomFilter(QWidget *owner, DS2CursorTargetQuery target_query)
+    : QObject(owner), view(owner), dragging(false), last_x(0),
+      targetQuery(target_query) {}
 
 protected:
   bool eventFilter(QObject *watched, QEvent *event) override
@@ -493,7 +573,7 @@ protected:
           // Otherwise choose the nearest visible cursor line.
           // Original trigger/channel marker controls remain outside plot.
           if(!chosen && time_active && x >= 12 && x < plot_width - 12 &&
-             y >= 36 && y < plot_height - 12)
+             y >= 30 && y < plot_height - 12)
           {
             const double da = std::fabs(x - cursorPlotX("ds2_cursor_a_time", plot_width));
             const double db = std::fabs(x - cursorPlotX("ds2_cursor_b_time", plot_width));
@@ -511,7 +591,13 @@ protected:
           if(chosen)
           {
             moving_cursor = chosen;
+            // Cursor-line hit testing is unchanged. Ctrl is the optional snap
+            // modifier; Shift+left remains reserved for panning.
+            const DS2CursorTarget target = targetQuery(chosen, x, y,
+                                                        plot_width, plot_height);
+            showTarget(target, false);
             view->setCursor(chosen <= 2 ? Qt::SizeHorCursor : Qt::SizeVerCursor);
+            view->update();
             mouse->accept();
             return true;
           }
@@ -523,22 +609,31 @@ protected:
         if(!(mouse->buttons() & Qt::LeftButton))
         {
           moving_cursor = 0;
+          hideTarget();
           view->unsetCursor();
+          view->update();
           return false;
         }
+        const double mx = std::max(0.0, std::min(double(plot_width),
+                                                 double(mouse->x() - border)));
+        const double my = std::max(0.0, std::min(double(plot_height),
+                                                 double(mouse->y() - border)));
+        const DS2CursorTarget target = targetQuery(moving_cursor, mx, my,
+                                                     plot_width, plot_height);
+        const bool ctrl = (mouse->modifiers() & Qt::ControlModifier) != 0;
+        const bool snapped = ctrl && target.valid &&
+            (moving_cursor <= 2 ? std::fabs(mx - target.x) <= 10.0
+                                : std::fabs(my - target.y) <= 10.0);
+        showTarget(target, snapped);
         if(moving_cursor <= 2)
         {
-          const double px = std::max(0.0, std::min(double(plot_width),
-                                           double(mouse->x() - border)));
           view->setProperty(moving_cursor == 1 ? "ds2_cursor_a_time" : "ds2_cursor_b_time",
-                            plotTimeAtX(px, plot_width));
+                            snapped ? target.time : plotTimeAtX(mx, plot_width));
         }
         else
         {
-          const double py = std::max(0.0, std::min(double(plot_height),
-                                           double(mouse->y() - border)));
           view->setProperty(moving_cursor == 3 ? "ds2_y_cursor_a_volt" : "ds2_y_cursor_b_volt",
-                            plotVoltageAtY(py, plot_height));
+                            snapped ? target.voltage : plotVoltageAtY(my, plot_height));
         }
         view->update();
         mouse->accept();
@@ -550,7 +645,9 @@ protected:
         if(mouse->button() == Qt::LeftButton)
         {
           moving_cursor = 0;
+          hideTarget();
           view->unsetCursor();
+          view->update();
           mouse->accept();
           return true;
         }
@@ -695,6 +792,21 @@ private:
   int last_x;
   int wheel_remainder = 0;
   int moving_cursor = 0;  // 1/2 = time A/B, 3/4 = voltage A/B
+  DS2CursorTargetQuery targetQuery;
+
+  void showTarget(const DS2CursorTarget &target, bool snapped)
+  {
+    view->setProperty("ds2_target_visible", target.valid);
+    view->setProperty("ds2_target_x", target.x);
+    view->setProperty("ds2_target_y", target.y);
+    view->setProperty("ds2_target_snap", snapped);
+  }
+
+  void hideTarget()
+  {
+    view->setProperty("ds2_target_visible", false);
+    view->setProperty("ds2_target_snap", false);
+  }
   bool moving_overlay = false;
   QPoint last_overlay_pos;
   QPointer<QDockWidget> measure_dock;
@@ -1005,7 +1117,189 @@ SignalCurve::SignalCurve(QWidget *w_parent) : QWidget(w_parent)
   setProperty("ds2_measure_popout_rect", QRect());
   setProperty("ds2_measure_x_text", QString());
   setProperty("ds2_measure_y_text", QString());
-  installEventFilter(new DS2000ZoomFilter(this));
+  setProperty("ds2_target_visible", false);
+  setProperty("ds2_target_snap", false);
+
+  // Query native scope samples without modifying their buffers. The filter
+  // calls this only while the user is actively dragging a measurement cursor.
+  // Same time/voltage transforms are used in drawWidget/ds2_draw_raw_trace.
+  const DS2CursorTargetQuery cursorTargetQuery =
+      [this](int which, double mouseX, double mouseY, int pw, int ph) -> DS2CursorTarget {
+    DS2CursorTarget target;
+    if(!devparms || devparms->modelserie != 2 || !devparms->connected ||
+       pw < 10 || ph < 10 || devparms->math_fft || devparms->timebasedelayenable ||
+       !(devparms->timebasescale > 0.0) || devparms->hordivisions <= 0 ||
+       devparms->vertdivisions <= 0) return target;
+
+    // X: selected EDGE trigger source. Y: currently selected voltage channel.
+    const int ch = which <= 2 ? devparms->triggeredgesource
+                              : property("ds2_y_cursor_channel").toInt();
+    if(ch < 0 || ch >= devparms->channel_cnt || ch >= MAX_CHNS || ch >= 4 ||
+       !(devparms->chanscale[ch] > 0.0)) return target;
+    const DS2RawSnapshot snapshot = ds2_raw_snapshot();
+    // V1.9d: Precision cursor targets are available only from a cached RAW
+    // snapshot. NORM waveforms are too sparse for dependable level crossings.
+    // Returning an invalid target also disables Ctrl-snap while dragging.
+    if(!snapshot.enabled || snapshot.busy) return target;
+    const bool raw_mode = snapshot.enabled;
+    if(raw_mode ? !snapshot.traces[ch].valid() : !devparms->chandisplay[ch])
+      return target;
+
+    const double zoom = std::max(1.0, property("ds2_zoom_factor").toDouble());
+    const double center = property("ds2_zoom_center").toDouble();
+    const double span = devparms->hordivisions * devparms->timebasescale;
+    const double visibleSpan = span / zoom;
+    const double leftTime = devparms->timebaseoffset +
+                            (center - 0.5 - 0.5/zoom) * span;
+    const double fullScale = devparms->chanscale[ch] * devparms->vertdivisions;
+    const double offset = devparms->chanoffset[ch];
+    auto toX = [&](double t) -> double { return (t - leftTime) * pw / visibleSpan; };
+    auto toY = [&](double v) -> double { return ph * (0.5 - (v + offset) / fullScale); };
+    auto toVoltage = [&](double py) -> double {
+      return (0.5 - py / ph) * fullScale - offset;
+    };
+
+    // X cursor: find the nearest crossing of the *trigger voltage* by
+    // the selected trigger-source channel. Search BOTH rising and falling
+    // crossings, anywhere in the visible trace. Unlike V1.9b this is NOT
+    // restricted to the scope's time-zero reference. Mouse Y is irrelevant:
+    // grabbing the A/B handle at the top must show the same target as
+    // grabbing the vertical cursor line.
+    if(which <= 2)
+    {
+      const double triggerVoltage = devparms->triggeredgelevel[ch];
+      const double targetY = toY(triggerVoltage);
+      if(!std::isfinite(targetY) || targetY < 0.0 || targetY >= ph)
+        return target;
+
+      double firstSampleTime = 0.0;
+      double sampleInterval = 0.0;
+      int sampleCount = 0;
+      if(raw_mode)
+      {
+        const DS2RawTrace &trace = snapshot.traces[ch];
+        sampleInterval = trace.xincrement;
+        firstSampleTime = trace.xorigin +
+            (double(trace.first_point - 1) - trace.xreference) * sampleInterval;
+        sampleCount = trace.bytes.size();
+      }
+      else
+      {
+        sampleInterval = devparms->timebasescale / 100.0;
+        firstSampleTime = devparms->xorigin[ch];
+        sampleCount = (devparms->wavebuf[ch] != nullptr) ?
+                       devparms->wavebufsz : 0;
+      }
+      if(!(sampleInterval > 0.0) || !std::isfinite(sampleInterval) ||
+         !std::isfinite(firstSampleTime) || sampleCount < 2)
+        return target;
+
+      // Use the same calibrated voltage conversion as the two trace
+      // renderers. Read the real samples, never the min/max pixel envelope.
+      auto sampleVoltage = [&](int index) -> double {
+        if(raw_mode)
+        {
+          const DS2RawTrace &trace = snapshot.traces[ch];
+          return (double(trace.bytes[index]) - trace.yorigin -
+                  trace.yreference) * trace.yincrement;
+        }
+        return double(devparms->wavebuf[ch][index]) *
+               devparms->chanscale[ch] / 25.0;
+      };
+
+      double crossingTime = 0.0;
+      const double cursorTime = leftTime + (mouseX / pw) * visibleSpan;
+      if(ds2_find_nearest_level_crossing(sampleCount, firstSampleTime,
+                 sampleInterval, leftTime, leftTime + visibleSpan,
+                 cursorTime, triggerVoltage, sampleVoltage, crossingTime))
+      {
+        target.valid = true;
+        target.x = toX(crossingTime);
+        target.y = targetY;
+        target.time = crossingTime;
+        target.voltage = triggerVoltage;
+      }
+      return target;
+    }
+
+    // Y cursor: determine a local, robust plateau voltage near the mouse.
+    // NORM carries far fewer samples, so use a somewhat wider pixel region
+    // than RAW while still rejecting isolated spikes/steep transitions.
+    const double searchRadius = raw_mode ? 18.0 : 32.0;
+    const double xMin = mouseX - searchRadius;
+    const double xMax = mouseX + searchRadius;
+    std::vector<double> nearY;
+    auto collect = [&](double time, double volts) {
+      const double px = toX(time);
+      if(px < xMin || px > xMax) return;
+      const double py = toY(volts);
+      if(std::fabs(py - mouseY) <= 22.0)
+        nearY.push_back(py);
+    };
+
+    if(raw_mode)
+    {
+      const DS2RawTrace &trace = snapshot.traces[ch];
+      const int count = trace.bytes.size();
+      const double tStart = leftTime + (xMin / pw) * visibleSpan;
+      const double tEnd = leftTime + (xMax / pw) * visibleSpan;
+      auto index = [&](double t) -> double {
+        return trace.xreference + (t - trace.xorigin) / trace.xincrement
+               - (trace.first_point - 1);
+      };
+      const int start = std::max(0, std::min(count, int(std::floor(index(tStart))) - 2));
+      const int finish = std::max(-1, std::min(count - 1, int(std::ceil(index(tEnd))) + 2));
+      const int stride = std::max(1, (finish - start + 1) / 600);
+      for(int sampleIndex = start; sampleIndex <= finish; sampleIndex += stride)
+      {
+        const double t = trace.xorigin +
+             ((sampleIndex + trace.first_point - 1) - trace.xreference) * trace.xincrement;
+        const double v = (double(trace.bytes[sampleIndex]) - trace.yorigin -
+                          trace.yreference) * trace.yincrement;
+        collect(t, v);
+      }
+    }
+    else if(devparms->wavebuf[ch] && devparms->wavebufsz > 1)
+    {
+      const int count = devparms->wavebufsz;
+      const double dt = devparms->timebasescale / 100.0;
+      if(!(dt > 0.0)) return target;
+      const double tStart = leftTime + (xMin / pw) * visibleSpan;
+      const double tEnd = leftTime + (xMax / pw) * visibleSpan;
+      const int start = std::max(0, std::min(count, int(std::floor(
+          (tStart - devparms->xorigin[ch]) / dt)) - 2));
+      const int finish = std::max(-1, std::min(count - 1, int(std::ceil(
+          (tEnd - devparms->xorigin[ch]) / dt)) + 2));
+      for(int sampleIndex = start; sampleIndex <= finish; ++sampleIndex)
+      {
+        const double t = devparms->xorigin[ch] + sampleIndex * dt;
+        const double v = double(devparms->wavebuf[ch][sampleIndex]) *
+                         devparms->chanscale[ch] / 25.0;
+        collect(t, v);
+      }
+    }
+
+    // Local level estimator: median with a trimmed mean near the median.
+    // This rejects narrow noise spikes; a steep edge or ambiguous level
+    // (large dispersion in this neighbourhood) produces no snap target.
+    if(nearY.size() < 2) return target;
+    std::sort(nearY.begin(), nearY.end());
+    const double median = nearY[nearY.size() / 2];
+    double sum = 0.0;
+    int accepted = 0;
+    for(double py : nearY)
+      if(std::fabs(py - median) <= 5.0) { sum += py; ++accepted; }
+    if(accepted < 2 || accepted * 2 < int(nearY.size())) return target;
+    const double averagedY = sum / accepted;
+    if(averagedY < 0 || averagedY >= ph ||
+       std::fabs(averagedY - mouseY) > 22.0) return target;
+    target.valid = true;
+    target.x = mouseX;
+    target.y = averagedY;
+    target.voltage = toVoltage(averagedY);
+    return target;
+  };
+  installEventFilter(new DS2000ZoomFilter(this, cursorTargetQuery));
   // DS2302 RAW controls: real Qt buttons in the lower black status strip.
   // The shortcut and the toggle button share exactly the same behavior.
   DS2RawControls *raw_controls = new DS2RawControls(this);
@@ -1024,6 +1318,9 @@ SignalCurve::SignalCurve(QWidget *w_parent) : QWidget(w_parent)
     }
     const bool leaving_raw = before.enabled;
     ds2_raw_toggle();
+    // Never carry an old target square or snap indication across modes.
+    setProperty("ds2_target_visible", false);
+    setProperty("ds2_target_snap", false);
     if(leaving_raw && property("ds2_zoom_factor").toDouble() > 16.0)
     {
       setProperty("ds2_zoom_factor", 1.0);
@@ -1821,6 +2118,33 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
     const QFontMetrics ds2_fm(painter->font());
     setProperty("ds2_measure_y_inline",
                 ds2_fm.horizontalAdvance(values) + 38 <= curve_w ? values : compact);
+  }
+
+  // V1.9d: target square and Ctrl-snap feedback ONLY for the RAW snapshot.
+  // The small square is drawn while dragging; the ring confirms Ctrl-snap.
+  if(ds2_snapshot_mode && !ds2_raw_state_local.busy &&
+     (ds2_cursor_visible || ds2_y_cursor_visible) &&
+     property("ds2_target_visible").toBool())
+  {
+    const double tx = property("ds2_target_x").toDouble();
+    const double ty = property("ds2_target_y").toDouble();
+    if(tx >= 0 && tx < curve_w && ty >= 0 && ty < curve_h)
+    {
+      painter->save();
+      painter->setClipRect(QRect(0, 0, curve_w, curve_h));
+      painter->setRenderHint(QPainter::Antialiasing, true);
+      painter->setPen(QPen(Qt::black, 3.0));
+      painter->setBrush(Qt::NoBrush);
+      painter->drawRect(QRectF(tx - 4, ty - 4, 8, 8));
+      painter->setPen(QPen(Qt::white, 1.5));
+      painter->drawRect(QRectF(tx - 4, ty - 4, 8, 8));
+      if(property("ds2_target_snap").toBool())
+      {
+        painter->setPen(QPen(QColor(80, 240, 150), 1.5));
+        painter->drawEllipse(QPointF(tx, ty), 11.0, 11.0);
+      }
+      painter->restore();
+    }
   }
 
   // DS2000: one framed, movable on-screen value panel.

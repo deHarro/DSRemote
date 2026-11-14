@@ -35,6 +35,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <cctype>
+#include <string>
 #include <QDebug>
 
 #define MAX_CMD_LEN  (255)
@@ -44,9 +46,69 @@ int tmc_connection_type = 0;
 struct tmcdev *tmc_device = nullptr;
 extern osclan *ocs;
 
+
+// The DS2000 family has a single SPI data line (SDA), unlike some other Rigol
+// series.  Enable this compatibility alias only after the scope's *IDN? reply.
+// Reset the detection for every connection so other models stay untouched.
+static bool ds2000_spi_compat = false;
+static bool expecting_lan_idn = false;
+
+static bool is_ds2000_idn(const char *response)
+{
+    const char vendor[] = "RIGOL TECHNOLOGIES,";
+    if(strncmp(response, vendor, sizeof(vendor) - 1) != 0) return false;
+    const char *model = response + sizeof(vendor) - 1;
+    if(strlen(model) < 6) return false;
+    // DS2xxx, DS2xxxA and DS2xxxA-S are handled as DS2000 by DSRemote.
+    return model[0] == 'D' && model[1] == 'S' && model[2] == '2' &&
+           std::isdigit(static_cast<unsigned char>(model[3])) &&
+           std::isdigit(static_cast<unsigned char>(model[4])) &&
+           std::isdigit(static_cast<unsigned char>(model[5]));
+}
+
+static std::string ds2000_spi_alias(const char *command)
+{
+    std::string result(command);
+    if(!ds2000_spi_compat) return result;
+
+    // Match the Python bridge's DS2000 alias, but only for SPI data-line
+    // THR / SOURCE / POLARITY commands on BUS1 or BUS2.
+    std::string upper(result);
+    for(char &ch : upper)
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+
+    if(upper.compare(0, 10, ":BUS1:SPI:") != 0 &&
+       upper.compare(0, 10, ":BUS2:SPI:") != 0)
+        return result;
+
+    const size_t line_pos = 10;
+    if(upper.compare(line_pos, 5, "MISO:") != 0 &&
+       upper.compare(line_pos, 5, "MOSI:") != 0)
+        return result;
+
+    const size_t field_pos = line_pos + 5;
+    const size_t field_end = upper.find_first_of("? \t", field_pos);
+    if(field_end == std::string::npos) return result;
+    const std::string field = upper.substr(field_pos, field_end - field_pos);
+    if(field != "THR" && field != "THRESHOLD" &&
+       field != "SOUR" && field != "SOURCE" &&
+       field != "POL" && field != "POLARITY")
+        return result;
+
+    // As in the Python bridge, only query ('?') or write (' ' / '\t') forms.
+    if(upper[field_end] == '?' && field_end + 1 != upper.size()) return result;
+    if(upper[field_end] != '?' && upper.find_first_not_of(" \t", field_end) == std::string::npos)
+        return result;
+
+    result.replace(line_pos, 5, "SDA:");
+    return result;
+}
+
 struct tmcdev *tmc_open_usb(const char *device)
 {
     if(tmc_device) tmc_close();
+    ds2000_spi_compat = false;
+    expecting_lan_idn = false;
     tmc_connection_type = 0;
     tmc_device = tmcdev_open(device);
     return tmc_device;
@@ -55,6 +117,8 @@ struct tmcdev *tmc_open_usb(const char *device)
 struct tmcdev *tmc_open_lan(const char *address)
 {
     if(tmc_device || ocs) tmc_close();
+    ds2000_spi_compat = false;
+    expecting_lan_idn = false;
     tmc_connection_type = 1;
     ocs = new osclan();
 
@@ -89,6 +153,8 @@ void tmc_close(void)
         }
     }
     tmc_device = nullptr;
+    ds2000_spi_compat = false;
+    expecting_lan_idn = false;
 }
 
 int tmc_write(const char *cmd)
@@ -99,12 +165,20 @@ int tmc_write(const char *cmd)
     if(tmc_connection_type == 0) return tmcdev_write(tmc_device, cmd);
     if(!ocs) return -1;
 
+    if(strcmp(cmd, "*IDN?") == 0)
+        expecting_lan_idn = true;
+
+    const std::string translated = ds2000_spi_alias(cmd);
+    const int wire_len = static_cast<int>(translated.size());
+    if(wire_len > MAX_CMD_LEN) return -1;
     char wire[MAX_CMD_LEN + 2];
-    memcpy(wire, cmd, len);
-    wire[len] = '\n';
-    wire[len + 1] = 0;
-    qDebug("LAN -> %s", cmd);
-    if(ocs->write(wire, len + 1) != len + 1) return -1;
+    memcpy(wire, translated.data(), wire_len);
+    wire[wire_len] = '\n';
+    wire[wire_len + 1] = 0;
+    if(translated != cmd)
+        qDebug("DS2000 SPI alias: %s => %s", cmd, translated.c_str());
+    qDebug("LAN -> %s", translated.c_str());
+    if(ocs->write(wire, wire_len + 1) != wire_len + 1) return -1;
 
     // A query can contain arguments after the '?' (e.g. :MEAS:ITEM? VPP,CHAN1).
     const bool query = strchr(cmd, '?') != nullptr;
@@ -150,6 +224,12 @@ int tmc_read(void)
         while(size > 0 && (dst[size-1] == '\n' || dst[size-1] == '\r')) --size;
         dst[size] = 0;
         tmc_device->sz = size;
+        if(expecting_lan_idn) {
+            ds2000_spi_compat = is_ds2000_idn(dst);
+            expecting_lan_idn = false;
+            qDebug("LAN model: DS2000 SPI compatibility %s",
+                   ds2000_spi_compat ? "enabled" : "disabled");
+        }
         qDebug("LAN <- ASCII (%d bytes): %.120s", size, dst);
         return size;
     }

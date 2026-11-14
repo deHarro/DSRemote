@@ -191,7 +191,7 @@ The names below document successive development steps; the published Git referen
 - Windows port and upstream for this fork: [pvvx/DSRemote](https://github.com/pvvx/DSRemote)
 - Windows 11 / DS2000 extensions documented here: this fork
 
-This fork of DSRemote is coded mainly be ChatGPT, guided carefully and intensely by the owner of this repository.
+This fork of DSRemote is coded mainly by ChatGPT, guided carefully and intensely by the owner of this repository.
 
 The project retains the upstream **GNU General Public License v3**; see the repository's `LICENSE` file. Existing copyright notices and author credits remain applicable.
 

@@ -52,7 +52,7 @@ DS2RawSnapshot ds2_raw_state;
 bool ds2_raw_pending = false;
 // Higher STOP/RAW cap. The current LAN path accepts up to 2 MiB per binary block;
 // this cap keeps a single channel below 1 MiB of raw ADC data.
-constexpr int DS2_RAW_SAFE_POINT_LIMIT = 1000000;
+constexpr int DS2_RAW_SAFE_POINT_LIMIT = 1400000;
 
 bool ds2_scpi_write(const QString &s)
 {
@@ -378,6 +378,8 @@ void screen_thread::set_device(struct tmcdev *tmdev)
   params.connected = 0;
 
   device = tmdev;
+
+  ds2_trigger_sync_timer.start();
 }
 
 
@@ -397,6 +399,7 @@ screen_thread::screen_thread()
   params.cmd_cue_idx_in = 0;
   params.cmd_cue_idx_out = 0;
   params.connected = 0;
+  params.ds2_trigger_sync_valid = 0;
 }
 
 
@@ -416,6 +419,7 @@ void screen_thread::set_params(struct device_settings *dev_parms)
   deviceparms = dev_parms;
   params.connected = deviceparms->connected;
   params.modelserie = deviceparms->modelserie;
+  params.triggermode = deviceparms->triggermode;
   params.chandisplay[0] = deviceparms->chandisplay[0];
   params.chandisplay[1] = deviceparms->chandisplay[1];
   params.chandisplay[2] = deviceparms->chandisplay[2];
@@ -469,6 +473,18 @@ void screen_thread::get_params(struct device_settings *dev_parms)
   dev_parms->cmd_cue_idx_out = params.cmd_cue_idx_out;
   dev_parms->thread_result = params.result;
   dev_parms->thread_job = params.job;
+
+  // Laeuft im GUI-Thread: die beiden zusammengehoerigen Werte atomar
+  // aus dem abgeschlossenen Screen-Thread uebernehmen. Kein SCPI-Write.
+  if(params.modelserie == 2 && params.ds2_trigger_sync_valid)
+  {
+    const int chn = params.ds2_trigger_sync_source;
+    if(chn >= 0 && chn < dev_parms->channel_cnt)
+    {
+      dev_parms->triggeredgelevel[chn] = params.ds2_trigger_sync_level;
+      dev_parms->triggeredgesource = chn;
+    }
+  }
   if(dev_parms->thread_job == TMC_THRD_JOB_TRIGEDGELEV)
   {
     dev_parms->thread_value = params.triggeredgelevel;
@@ -611,6 +627,46 @@ int screen_thread::get_devicestatus()
   }
 
   params.memdepth = atoi(device->buf);
+
+  // DS2302: etwa jede Sekunde die tatsaechliche EDGE-Triggerquelle und
+  // deren Level einlesen, ohne den Trigger am Oszi umzuschalten.
+  // Nur bei normalem Status-Polling (nicht waehrend CMD/RAW-Verarbeitung).
+  if(params.modelserie == 2 && params.triggermode == 0 &&
+     ds2_trigger_sync_timer.isValid() &&
+     ds2_trigger_sync_timer.elapsed() >= 1000)
+  {
+    ds2_trigger_sync_timer.restart();
+
+    QString trig_source, trig_level;
+    if(!ds2_scpi_query(device, ":TRIG:EDG:SOUR?", trig_source))
+    {
+      line = __LINE__;
+      goto OUT_ERROR;
+    }
+
+    int chn = -1;
+    if(trig_source == "CHAN1") chn = 0;
+    else if(trig_source == "CHAN2") chn = 1;
+
+    // Nur CH1/CH2 werden derzeit synchronisiert, keine EXT-Quelle.
+    if(chn >= 0)
+    {
+      if(!ds2_scpi_query(device, ":TRIG:EDG:LEV?", trig_level))
+      {
+        line = __LINE__;
+        goto OUT_ERROR;
+      }
+
+      bool valid_level = false;
+      const double level = trig_level.toDouble(&valid_level);
+      if(valid_level && std::isfinite(level))
+      {
+        params.ds2_trigger_sync_source = chn;
+        params.ds2_trigger_sync_level = level;
+        params.ds2_trigger_sync_valid = 1;
+      }
+    }
+  }
 
   if(params.countersrc)
   {
@@ -788,6 +844,8 @@ void screen_thread::run()
   params.result = TMC_THRD_RESULT_NONE;
 
   params.job = TMC_THRD_JOB_NONE;
+
+  params.ds2_trigger_sync_valid = 0;
 
   params.wavebufsz = 0;
 

@@ -38,6 +38,7 @@
 
 #include <QObject>
 #include <QThread>
+#include <QElapsedTimer>
 
 #include "global.h"
 #include "utils.h"
@@ -73,6 +74,7 @@ private:
     double chanscale[MAX_CHNS];
     int triggerstatus;
     int triggersweep;
+    int triggermode;  // DS2302: EDGE-Pruefung fuer passives Trigger-Polling
     double samplerate;
     int memdepth;
     int countersrc;
@@ -87,6 +89,10 @@ private:
     int job;
 
     double triggeredgelevel;
+    // DS2302: separate Werte fuer die periodische, nur lesende Synchronisierung.
+    int ds2_trigger_sync_valid;
+    int ds2_trigger_sync_source;
+    double ds2_trigger_sync_level;
     double timebasedelayoffset;
     double timebasedelayscale;
 
@@ -114,6 +120,8 @@ private:
 
     char debug_str[1024];
   } params;
+
+  QElapsedTimer ds2_trigger_sync_timer;
 
   struct tmcdev *device;
 

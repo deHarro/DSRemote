@@ -3905,16 +3905,17 @@ void UI_Mainwindow::trigMenuButtonClicked()
   menu.exec(trigMenuButton->mapToGlobal(QPoint(0,0)));
 }
 
-
 void UI_Mainwindow::trigger_source_ch1()
 {
-  devparms.triggeredgesource = 0;
+    devparms.triggeredgesource = 0;
 
-  statusLabel->setText("Trigger source channel 1");
+    statusLabel->setText("Trigger source channel 1");
 
-  set_cue_cmd(":TRIG:EDG:SOUR CHAN1");
+    set_cue_cmd(":TRIG:EDG:SOUR CHAN1");
+
+    // Trigger-Marker nach Quellenwechsel neu zeichnen
+    waveForm->update();
 }
-
 
 void UI_Mainwindow::trigger_source_ch2()
 {

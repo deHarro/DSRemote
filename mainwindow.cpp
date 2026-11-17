@@ -679,6 +679,25 @@ int UI_Mainwindow::get_device_settings(int delay)
         trigModeSingLed->setValue(true);
       }
 
+
+      fprintf(stderr,
+              "START-POS:\n"
+              "  CH1 OFFS  = %.3f V\n"
+              "  CH1 SCALE = %.3f V/div\n"
+              "  CH2 OFFS  = %.3f V\n"
+              "  CH2 SCALE = %.3f V/div\n"
+              "  TRIG CH1  = %.3f V\n"
+              "  TRIG CH2  = %.3f V\n"
+              "  TRIG SRC  = %d (0=CH1, 1=CH2)\n",
+              devparms.chanoffset[0],
+              devparms.chanscale[0],
+              devparms.chanoffset[1],
+              devparms.chanscale[1],
+              devparms.triggeredgelevel[0],
+              devparms.triggeredgelevel[1],
+              devparms.triggeredgesource);
+
+
   updateLabels();
 
   return 0;

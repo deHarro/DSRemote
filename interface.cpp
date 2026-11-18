@@ -909,9 +909,22 @@ void UI_Mainwindow::vertOffsetDialChanged(int new_pos)
 
   label_timer->start(LABEL_TIMER_IVAL);
 
-  vertOffsDial_timer->start(TMC_DIAL_TIMER_DELAY);
-
   old_pos = new_pos;
+
+  // DS2302_OFFSET_DIAL_DIRECT_V1:
+  // DS2000: Den aktuell berechneten Offset sofort ueber den regulaeren
+  // Command-Queue-Weg senden, statt erst auf den Dial-Timer zu warten.
+  // Ein eventuell noch aktiver Timer darf keinen alten Wert nachsenden.
+  if(devparms.modelserie == 2)
+  {
+    vertOffsDial_timer->stop();
+    snprintf(str, 512, ":CHAN%i:OFFS %e", chn + 1, devparms.chanoffset[chn]);
+    set_cue_cmd(str);
+  }
+  else
+  {
+    vertOffsDial_timer->start(TMC_DIAL_TIMER_DELAY);
+  }
 
   waveForm->update();
 }
@@ -1512,7 +1525,8 @@ void UI_Mainwindow::set_acq_average()
 
 void UI_Mainwindow::cursButtonClicked()
 {
-  // DS2000_XY_CURSOR_V2: rein lokale Messcursor, keine SCPI-Kommandos.
+  // DS2302_CURSOR_MODE_SYNC_V1: lokale Messcursor und Rigol-Modus koppeln.
+  // Die eigentliche SCPI-Sequenz wird ausschliesslich im Screen-Thread ausgefuehrt.
   if(devparms.modelserie != 2)
   {
     statusLabel->setText("Messcursor bisher nur fuer DS2000/DS2302");
@@ -1566,6 +1580,16 @@ void UI_Mainwindow::cursButtonClicked()
     statusLabel->setText("Messcursor aus");
   }
   waveForm->update();
+
+  // Interner Auftrag an den Screen-Thread; KEIN SCPI-Kommando fuer das Rigol.
+  // X/Y/XY entsprechen der bereits funktionierenden lokalen Cursorfolge.
+  if(devparms.connected)
+  {
+    if(x && y)      set_cue_cmd("@DS2:CURSOR:XY");
+    else if(x)      set_cue_cmd("@DS2:CURSOR:X");
+    else if(y)      set_cue_cmd("@DS2:CURSOR:Y");
+    else            set_cue_cmd("@DS2:CURSOR:OFF");
+  }
 }
 
 

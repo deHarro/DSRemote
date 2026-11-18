@@ -33,6 +33,7 @@
 #include <QStringList>
 #include <QByteArray>
 #include <QVector>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -68,6 +69,104 @@ bool ds2_scpi_query(struct tmcdev *device, const QString &command, QString &answ
   if(n <= 0 || n > 512 || !device || !device->buf) return false;
   answer = QString::fromLatin1(device->buf, n).trimmed();
   return !answer.isEmpty();
+}
+
+// DS2302_CURSOR_MODE_SYNC_V1: Nur LESEN des undokumentierten Setup-Blocks.
+// Der Payload hat 2814 Byte. Byte 1630: X=0, Y=4, X-Y=8.
+// Niemals :SYST:SET zum Zurueckschreiben verwenden.
+static bool ds2_cursor_display_read(struct tmcdev *device, int &value)
+{
+  if(!device || !ds2_scpi_write(":SYST:SET?")) return false;
+  const int n = tmc_read();
+  if(n <= 0 || !device->buf) return false;
+
+  const unsigned char *data =
+      reinterpret_cast<const unsigned char *>(device->buf);
+  int len = n;
+  // Beide vom Projekt bereits bekannten Empfangsvarianten unterstuetzen:
+  // C++ LAN-Pfad liefert Payload direkt; ein anderer Pfad inkl. #9-Header.
+  if(len >= 11 && data[0] == '#' && data[1] == '9' &&
+     std::memcmp(data + 2, "000002814", 9) == 0)
+  {
+    data += 11;
+    len -= 11;
+  }
+  if(!((len == 2814) || (len == 2815 && data[2814] == '\n')) ||
+     std::memcmp(data + 4, "DS2A1", 5) != 0)
+    return false;
+
+  value = int(data[1630]);
+  return value == 0 || value == 4 || value == 8;
+}
+
+static bool ds2_cursor_key(const char *key, unsigned delay_ms)
+{
+  if(!ds2_scpi_write(QString(":SYST:KEY:PRES ") + key)) return false;
+  usleep(delay_ms * 1000u);
+  return true;
+}
+
+// Synchroner SCPI-Ablauf, aber AUSSCHLIESSLICH im Screen-Thread.
+// Interne Moduskommandos aus der Queue werden niemals ans Scope gesendet.
+static bool ds2_cursor_mode_set(struct tmcdev *device, const char *requested)
+{
+  QString mode;
+  if(!ds2_scpi_query(device, ":CURS:MODE?", mode)) return false;
+
+  if(std::strcmp(requested, "OFF") == 0)
+  {
+    if(!mode.startsWith("OFF", Qt::CaseInsensitive))
+    {
+      if(!ds2_scpi_write(":CURS:MODE OFF")) return false;
+      usleep(400000);
+      if(!ds2_scpi_query(device, ":CURS:MODE?", mode)) return false;
+    }
+    return mode.startsWith("OFF", Qt::CaseInsensitive);
+  }
+
+  int desired = -1;
+  if(std::strcmp(requested, "X") == 0) desired = 0;
+  else if(std::strcmp(requested, "Y") == 0) desired = 4;
+  else if(std::strcmp(requested, "XY") == 0) desired = 8;
+  if(desired < 0) return false;
+
+  // MAN per SCPI festlegen, ohne die problematische CURSor-Taste zu toggeln.
+  if(!mode.startsWith("MAN", Qt::CaseInsensitive))
+  {
+    if(!ds2_scpi_write(":CURS:MODE MAN")) return false;
+    usleep(450000);
+    if(!ds2_scpi_query(device, ":CURS:MODE?", mode) ||
+       !mode.startsWith("MAN", Qt::CaseInsensitive)) return false;
+  }
+
+  int current = -1;
+  if(!ds2_cursor_display_read(device, current)) return false;
+  if(current == desired) return true; // Menues unveraendert lassen.
+
+  // Der doppelte Menueaufruf ist am Rigol erprobt und verhindert MAN -> TRAC.
+  if(!ds2_cursor_key("ACQuire", 300) ||
+     !ds2_cursor_key("CURSor", 300)) return false;
+  if(!ds2_scpi_query(device, ":CURS:MODE?", mode) ||
+     !mode.startsWith("MAN", Qt::CaseInsensitive)) return false;
+
+  bool list_open = false;
+  bool matched = false;
+  for(int attempt = 0; attempt < 6; ++attempt)
+  {
+    if(!ds2_cursor_key("F2", 950)) break;
+    list_open = true;
+    if(!ds2_cursor_display_read(device, current)) break;
+    if(current == desired) { matched = true; break; }
+  }
+
+  // Nur wenn F2 die Auswahl geoeffnet hat, KFUNction betaetigen.
+  // Auch nach einem fehlgeschlagenen Versuch die Auswahlliste schliessen.
+  if(list_open && !ds2_cursor_key("KFUNction", 400)) return false;
+  if(!matched) return false;
+
+  if(!ds2_cursor_display_read(device, current) || current != desired) return false;
+  if(!ds2_scpi_query(device, ":CURS:MODE?", mode)) return false;
+  return mode.startsWith("MAN", Qt::CaseInsensitive);
 }
 
 bool ds2_capture_channel(struct tmcdev *device, int ch, int depth,
@@ -378,6 +477,8 @@ void screen_thread::set_device(struct tmcdev *tmdev)
   params.connected = 0;
   params.ds2_last_scope_activechannel = -1;
   params.ds2_pending_activechannel = -1;
+  params.ds2_timescale_last_valid = 0;
+  params.ds2_timescale_change_pending = 0;
 
   device = tmdev;
 
@@ -404,6 +505,8 @@ screen_thread::screen_thread()
   params.connected = 0;
   params.ds2_trigger_sync_valid = 0;
   params.ds2_position_sync_valid = 0;
+  params.ds2_timescale_last_valid = 0;
+  params.ds2_timescale_change_pending = 0;
 }
 
 
@@ -423,6 +526,15 @@ void screen_thread::set_params(struct device_settings *dev_parms)
   deviceparms = dev_parms;
   params.connected = deviceparms->connected;
   params.modelserie = deviceparms->modelserie;
+  // At connect, read_settings_thread already fetched :TIM:SCAL?.
+  // Use this as the baseline before the first periodic poll.
+  if(params.modelserie == 2 && !params.ds2_timescale_last_valid &&
+     std::isfinite(deviceparms->timebasescale) &&
+     deviceparms->timebasescale > 0.0)
+  {
+    params.ds2_timescale_last_polled = deviceparms->timebasescale;
+    params.ds2_timescale_last_valid = 1;
+  }
   params.triggermode = deviceparms->triggermode;
   params.chandisplay[0] = deviceparms->chandisplay[0];
   params.chandisplay[1] = deviceparms->chandisplay[1];
@@ -511,6 +623,24 @@ void screen_thread::get_params(struct device_settings *dev_parms)
 
       dev_parms->chandisplay[0] = params.chandisplay[0];
       dev_parms->chandisplay[1] = params.chandisplay[1];
+  }
+  // DS2302_TIMEBASE_SCOPE_SYNC_V1: accept the newly observed scope timebase
+  // only if DSRemote still shows the PREVIOUS scope value. When the operator
+  // has already changed the timebase locally, preserve the local request.
+  // This is deliberately event-driven rather than copying every poll result.
+  if(params.modelserie == 2 && params.ds2_timescale_change_pending)
+  {
+    const double old_scale = params.ds2_timescale_change_from;
+    const double new_scale = params.ds2_timescale_change_to;
+    const double tolerance = std::max(1e-15, std::fabs(old_scale) * 1e-7);
+    if(std::isfinite(new_scale) && new_scale > 0.0 &&
+       std::fabs(dev_parms->timebasescale - old_scale) <= tolerance)
+    {
+      dev_parms->timebasescale = new_scale;
+      if(!dev_parms->timebasedelayenable)
+        dev_parms->current_screen_sf = 100.0 / new_scale;
+    }
+    params.ds2_timescale_change_pending = 0;
   }
   if(dev_parms->thread_job == TMC_THRD_JOB_TRIGEDGELEV)
   {
@@ -695,19 +825,21 @@ int screen_thread::get_devicestatus()
     }
   }
 
-  // DS2302: CH1-, CH2- und Horizontalposition synchronisieren.
+  // DS2302: CH1-/CH2-Position, Horizontalposition UND Zeitbasis
+  // aus einem zusammengehoerigen Status-Poll lesen.
   if(params.modelserie == 2 &&
       ds2_position_sync_timer.isValid() &&
       ds2_position_sync_timer.elapsed() >= 1000)
   {
       ds2_position_sync_timer.restart();
 
-      QString ch1_text, ch2_text, time_text;
+      QString ch1_text, ch2_text, time_text, scale_text;
       QString disp1_text, disp2_text;
 
       if(!ds2_scpi_query(device, ":CHAN1:OFFS?", ch1_text) ||
           !ds2_scpi_query(device, ":CHAN2:OFFS?", ch2_text) ||
           !ds2_scpi_query(device, ":TIM:OFFS?", time_text) ||
+          !ds2_scpi_query(device, ":TIM:SCAL?", scale_text) ||
           !ds2_scpi_query(device, ":CHAN1:DISP?", disp1_text) ||
           !ds2_scpi_query(device, ":CHAN2:DISP?", disp2_text))
       {
@@ -715,20 +847,38 @@ int screen_thread::get_devicestatus()
           goto OUT_ERROR;
       }
 
-      bool ok1 = false, ok2 = false, ok3 = false;
+      bool ok1 = false, ok2 = false, ok3 = false, ok4 = false;
 
       const double ch1 = ch1_text.toDouble(&ok1);
       const double ch2 = ch2_text.toDouble(&ok2);
       const double tim = time_text.toDouble(&ok3);
+      const double scale = scale_text.toDouble(&ok4);
 
-      if(ok1 && ok2 && ok3 &&
+      if(ok1 && ok2 && ok3 && ok4 &&
           std::isfinite(ch1) &&
           std::isfinite(ch2) &&
-          std::isfinite(tim))
+          std::isfinite(tim) &&
+          std::isfinite(scale) && scale > 0.0)
       {
           params.ds2_position_chanoffset[0] = ch1;
           params.ds2_position_chanoffset[1] = ch2;
           params.ds2_position_timeoffset = tim;
+
+          // Only publish an actual CHANGE measured at the scope.
+          // Always keep the previous scope scale for the GUI-side conflict check.
+          if(params.ds2_timescale_last_valid)
+          {
+            const double previous = params.ds2_timescale_last_polled;
+            const double tolerance = std::max(1e-15, std::fabs(previous) * 1e-7);
+            if(std::fabs(scale - previous) > tolerance)
+            {
+              params.ds2_timescale_change_from = previous;
+              params.ds2_timescale_change_to = scale;
+              params.ds2_timescale_change_pending = 1;
+            }
+          }
+          params.ds2_timescale_last_polled = scale;
+          params.ds2_timescale_last_valid = 1;
           const QString d1 = disp1_text.trimmed();
           const QString d2 = disp2_text.trimmed();
 
@@ -1029,6 +1179,22 @@ void screen_thread::run()
   while(params.cmd_cue_idx_out != params.cmd_cue_idx_in)
   {
     usleep(TMC_GDS_DELAY);
+
+    // DS2302_CURSOR_MODE_SYNC_V1: ein interner Auftrag in der bestehenden
+    // Befehlswarteschlange. Diesen String NICHT an das Rigol senden.
+    const char *queued = deviceparms->cmd_cue[params.cmd_cue_idx_out];
+    if(std::strncmp(queued, "@DS2:CURSOR:", 12) == 0)
+    {
+      const char *requested = queued + 12;
+      const bool ok = (params.modelserie == 2) &&
+                      ds2_cursor_mode_set(device, requested);
+      fprintf(stderr, "DS2302 Cursor-Mode %s: %s\n",
+              requested, ok ? "OK" : "FEHLER");
+      fflush(stderr);
+      params.cmd_cue_idx_out = (params.cmd_cue_idx_out + 1) % TMC_CMD_CUE_SZ;
+      cmd_sent = 1;
+      continue;
+    }
 
     tmc_write(deviceparms->cmd_cue[params.cmd_cue_idx_out]);
 

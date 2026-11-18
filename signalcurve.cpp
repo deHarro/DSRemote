@@ -56,6 +56,7 @@
 #include <cmath>
 #include <algorithm>
 #include <functional>
+#include <memory>
 #include <vector>
 
 // DS2000 display-only horizontal zoom, independent of the instrument timebase.
@@ -461,9 +462,12 @@ static bool ds2_find_nearest_level_crossing(int count, double firstTime,
 class DS2000ZoomFilter : public QObject
 {
 public:
-  explicit DS2000ZoomFilter(QWidget *owner, DS2CursorTargetQuery target_query)
+  explicit DS2000ZoomFilter(QWidget *owner, DS2CursorTargetQuery target_query,
+                            std::function<void(int)> x_cursor_commit,
+                            std::function<void(int)> y_cursor_commit)
     : QObject(owner), view(owner), dragging(false), last_x(0),
-      targetQuery(target_query) {}
+      targetQuery(target_query), xCursorCommit(x_cursor_commit),
+      yCursorCommit(y_cursor_commit) {}
 
 protected:
   bool eventFilter(QObject *watched, QEvent *event) override
@@ -644,6 +648,12 @@ protected:
         QMouseEvent *mouse = static_cast<QMouseEvent *>(event);
         if(mouse->button() == Qt::LeftButton)
         {
+          // Send the released measurement cursor to the Rigol only once.
+          // 1/2 = X A/B, 3/4 = Y A/B. Never send SCPI on mouse-move.
+          if(moving_cursor <= 2 && xCursorCommit)
+            xCursorCommit(moving_cursor);
+          else if(moving_cursor >= 3 && moving_cursor <= 4 && yCursorCommit)
+            yCursorCommit(moving_cursor);
           moving_cursor = 0;
           hideTarget();
           view->unsetCursor();
@@ -793,6 +803,8 @@ private:
   int wheel_remainder = 0;
   int moving_cursor = 0;  // 1/2 = time A/B, 3/4 = voltage A/B
   DS2CursorTargetQuery targetQuery;
+  std::function<void(int)> xCursorCommit;
+  std::function<void(int)> yCursorCommit;
 
   void showTarget(const DS2CursorTarget &target, bool snapped)
   {
@@ -1299,7 +1311,238 @@ SignalCurve::SignalCurve(QWidget *w_parent) : QWidget(w_parent)
     target.voltage = toVoltage(averagedY);
     return target;
   };
-  installEventFilter(new DS2000ZoomFilter(this, cursorTargetQuery));
+  // DS2302: Forward a released local time cursor through the existing
+  // GUI command queue. Never access the instrument directly from this filter.
+  auto xCursorCommit = [this](int which) {
+    if(!devparms || !mainwindow || !devparms->connected ||
+       devparms->modelserie != 2 || devparms->math_fft ||
+       devparms->timebasedelayenable || (which != 1 && which != 2)) return;
+
+    const double secPerDiv = property("ds2_base_time_per_div").toDouble();
+    const double divisions = property("ds2_cursor_divisions").toDouble();
+    if(!(secPerDiv > 0.0) || !(divisions > 0.0)) return;
+
+    const double offset = property("ds2_cursor_offset").toDouble();
+    const double t = property(which == 1 ? "ds2_cursor_a_time"
+                                         : "ds2_cursor_b_time").toDouble();
+    // Convert absolute local cursor time (including local zoom/pan) to
+    // the Rigol's 0..699 full-screen X coordinate.
+    const double scopeX = 699.0 * (0.5 + (t - offset) / (divisions * secPerDiv));
+    if(!std::isfinite(scopeX) || scopeX < 0.0 || scopeX > 699.0) return;
+    const int pixel = std::max(0, std::min(699, int(std::lround(scopeX))));
+
+    char cmd[64];
+    std::snprintf(cmd, sizeof(cmd), ":CURS:MAN:C%cX %d",
+                  which == 1 ? 'A' : 'B', pixel);
+    mainwindow->set_cue_cmd(cmd);
+  };
+  // DS2302: Y cursor position = absolute voltage level transformed to the
+  // scope's 0..399 top-down screen coordinate (0 = top, 399 = bottom).
+  // Use the active voltage channel's actual V/div and vertical offset.
+  // Just as for X cursors, only enqueue one SCPI command on mouse release.
+  auto yCursorCommit = [this](int which) {
+    if(!devparms || !mainwindow || !devparms->connected ||
+       devparms->modelserie != 2 || devparms->math_fft ||
+       devparms->timebasedelayenable || (which != 3 && which != 4) ||
+       !property("ds2_y_cursor_enabled").toBool() ||
+       !property("ds2_y_cursor_inited").toBool()) return;
+
+    const int ch = property("ds2_y_cursor_channel").toInt();
+    if(ch < 0 || ch >= devparms->channel_cnt || ch >= MAX_CHNS) return;
+    const double voltsPerDiv = devparms->chanscale[ch];
+    const double divisions = double(devparms->vertdivisions);
+    const double offset = devparms->chanoffset[ch];
+    if(!(voltsPerDiv > 0.0) || !(divisions > 0.0)) return;
+
+    const double volts = property(which == 3 ? "ds2_y_cursor_a_volt"
+                                              : "ds2_y_cursor_b_volt").toDouble();
+    const double scopeY = 399.0 *
+        (0.5 - (volts + offset) / (voltsPerDiv * divisions));
+    // An off-screen Y cursor cannot be represented by the Rigol pixel range.
+    if(!std::isfinite(scopeY) || scopeY < 0.0 || scopeY > 399.0) return;
+    const int pixel = std::max(0, std::min(399, int(std::lround(scopeY))));
+
+    char cmd[64];
+    std::snprintf(cmd, sizeof(cmd), ":CURS:MAN:C%cY %d",
+                  which == 3 ? 'A' : 'B', pixel);
+    mainwindow->set_cue_cmd(cmd);
+  };
+  installEventFilter(new DS2000ZoomFilter(this, cursorTargetQuery,
+                                          xCursorCommit, yCursorCommit));
+
+  // DS2302: Scope timebase/position changes move the local X cursor lines,
+  // because they store absolute times. Re-send both positions once the
+  // timebase is stable. Local mouse-wheel zoom does NOT trigger this.
+  // This timer only checks GUI values; it performs no SCPI polling.
+  struct DS2CursorTimebaseState
+  {
+    bool initialized = false;
+    double previousScale = 0.0;
+    double previousOffset = 0.0;
+    bool changedPending = false;
+    int stableSamples = 0;
+  };
+  const std::shared_ptr<DS2CursorTimebaseState> syncState(
+      new DS2CursorTimebaseState);
+  QTimer *ds2_cursor_timebase_watch = new QTimer(this);
+  ds2_cursor_timebase_watch->setInterval(200);
+  connect(ds2_cursor_timebase_watch, &QTimer::timeout, this,
+          [this, xCursorCommit, syncState]() {
+    if(!devparms || !devparms->connected || devparms->modelserie != 2)
+    {
+      syncState->initialized = false;
+      syncState->changedPending = false;
+      syncState->stableSamples = 0;
+      return;
+    }
+
+    const double scale = devparms->timebasescale;
+    const double offset = devparms->timebaseoffset;
+    if(!(scale > 0.0) || !std::isfinite(scale) || !std::isfinite(offset))
+      return;
+    if(!syncState->initialized)
+    {
+      syncState->previousScale = scale;
+      syncState->previousOffset = offset;
+      syncState->initialized = true;
+      return;
+    }
+
+    const double tolerance = std::max(1e-15, scale * 1e-7);
+    if(std::fabs(scale - syncState->previousScale) > tolerance ||
+       std::fabs(offset - syncState->previousOffset) > tolerance)
+    {
+      syncState->previousScale = scale;
+      syncState->previousOffset = offset;
+      syncState->changedPending = true;
+      syncState->stableSamples = 0;
+      return;
+    }
+
+    // At least 800 ms without another change, allowing the queued
+    // :TIM:SCAL/:TIM:OFFS command to reach the Rigol first.
+    if(syncState->changedPending && ++syncState->stableSamples >= 4)
+    {
+      syncState->changedPending = false;
+      if(property("ds2_cursor_enabled").toBool() &&
+         property("ds2_cursor_inited").toBool() &&
+         !devparms->math_fft && !devparms->timebasedelayenable)
+      {
+        xCursorCommit(1);
+        xCursorCommit(2);
+      }
+    }
+  });
+  ds2_cursor_timebase_watch->start();
+
+  // DS2302_YCURSOR_CHANNEL_SYNC_V1:
+  // On a CH1/CH2 selection, transfer the selected channel's local Y cursor
+  // pair to the single cursor pair on the Rigol. The per-channel voltages
+  // are already saved/restored by drawWidget; never change those values.
+  // Existing V/div and vertical-offset re-transmission remains unchanged.
+  // All SCPI writes use the established GUI command queue.
+  struct DS2CursorVerticalState
+  {
+    bool initialized = false;
+    int previousChannel = -1;
+    double previousScale = 0.0;
+    double previousOffset = 0.0;
+    bool previousYEnabled = false;
+    bool changedPending = false;
+    int stableSamples = 0;
+  };
+  const std::shared_ptr<DS2CursorVerticalState> verticalState(
+      new DS2CursorVerticalState);
+  QTimer *ds2_cursor_vertical_watch = new QTimer(this);
+  ds2_cursor_vertical_watch->setInterval(200);
+  connect(ds2_cursor_vertical_watch, &QTimer::timeout, this,
+          [this, yCursorCommit, verticalState]() {
+    if(!devparms || !devparms->connected || devparms->modelserie != 2)
+    {
+      verticalState->initialized = false;
+      verticalState->previousYEnabled = false;
+      verticalState->changedPending = false;
+      verticalState->stableSamples = 0;
+      return;
+    }
+
+    // drawWidget has already restored the new channel's independent YA/YB
+    // voltage levels into these properties before we try to send anything.
+    const int ch = property("ds2_y_cursor_channel").toInt();
+    if(ch < 0 || ch >= devparms->channel_cnt || ch >= MAX_CHNS)
+    {
+      verticalState->initialized = false;
+      verticalState->previousYEnabled = false;
+      verticalState->changedPending = false;
+      return;
+    }
+    const double scale = devparms->chanscale[ch];
+    const double offset = devparms->chanoffset[ch];
+    if(!(scale > 0.0) || !std::isfinite(scale) || !std::isfinite(offset))
+      return;
+
+    const bool yEnabled = property("ds2_y_cursor_enabled").toBool() &&
+        property("ds2_y_cursor_inited").toBool() &&
+        !devparms->math_fft && !devparms->timebasedelayenable;
+
+    // Send SOURCE before YA/YB, so the subsequent pixel coordinates are
+    // interpreted using the correct channel's graticule. This also runs
+    // once when Y cursors are first enabled on an already selected channel.
+    auto sendChannelCursors = [&]() {
+      if(!yEnabled || !mainwindow) return;
+      char cmd[64];
+      std::snprintf(cmd, sizeof(cmd), ":CURS:MAN:SOUR CHAN%d", ch + 1);
+      mainwindow->set_cue_cmd(cmd);
+      yCursorCommit(3);
+      yCursorCommit(4);
+    };
+
+    if(!verticalState->initialized || verticalState->previousChannel != ch)
+    {
+      verticalState->previousChannel = ch;
+      verticalState->previousScale = scale;
+      verticalState->previousOffset = offset;
+      verticalState->initialized = true;
+      verticalState->previousYEnabled = yEnabled;
+      verticalState->changedPending = false;
+      verticalState->stableSamples = 0;
+      sendChannelCursors();
+      return;
+    }
+
+    if(yEnabled && !verticalState->previousYEnabled)
+    {
+      verticalState->previousYEnabled = true;
+      sendChannelCursors();
+      return;
+    }
+    verticalState->previousYEnabled = yEnabled;
+
+    const double tolerance = std::max(1e-12, scale * 1e-7);
+    if(std::fabs(scale - verticalState->previousScale) > tolerance ||
+       std::fabs(offset - verticalState->previousOffset) > tolerance)
+    {
+      verticalState->previousScale = scale;
+      verticalState->previousOffset = offset;
+      verticalState->changedPending = true;
+      verticalState->stableSamples = 0;
+      return;
+    }
+
+    // Wait at least 800 ms so any queued :CHAN:SCAL / :CHAN:OFFS
+    // command has time to reach the oscilloscope before the cursors.
+    if(verticalState->changedPending && ++verticalState->stableSamples >= 4)
+    {
+      verticalState->changedPending = false;
+      if(yEnabled)
+      {
+        yCursorCommit(3);
+        yCursorCommit(4);
+      }
+    }
+  });
+  ds2_cursor_vertical_watch->start();
+
   // DS2302 RAW controls: real Qt buttons in the lower black status strip.
   // The shortcut and the toggle button share exactly the same behavior.
   DS2RawControls *raw_controls = new DS2RawControls(this);
@@ -1739,7 +1982,7 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
       v_sense = -((double)curve_h / (25.0 * devparms->vertdivisions));
     }
 
-  drawTrigCenterArrow(painter, curve_w / 2, 0);
+  //drawTrigCenterArrow(painter, curve_w / 2, 0);
 
   for(chn=0; chn<devparms->channel_cnt; chn++)
   {
@@ -2200,6 +2443,9 @@ void SignalCurve::drawWidget(QPainter *painter, int curve_w, int curve_h)
     setProperty("ds2_measure_popout_rect", popout.translated(bordersize, bordersize));
     painter->restore();
   }
+
+  // Grosses Trigger-Dreieck an dieselbe X-Position wie den T-Marker setzen
+  drawTrigCenterArrow(painter, trig_pos_arrow_pos, 0);
 
   if(devparms->countersrc)
   {

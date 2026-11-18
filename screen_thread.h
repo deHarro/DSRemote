@@ -97,6 +97,13 @@ private:
     int ds2_position_sync_valid;
     double ds2_position_chanoffset[2];
     double ds2_position_timeoffset;
+    // DS2302_TIMEBASE_SCOPE_SYNC_V1: event-driven sync of scope TIMEBASE.
+    // Do not overwrite a local DSRemote timebase edit with an old poll result.
+    int ds2_timescale_last_valid;
+    double ds2_timescale_last_polled;
+    int ds2_timescale_change_pending;
+    double ds2_timescale_change_from;
+    double ds2_timescale_change_to;
     int ds2_last_scope_activechannel;
     int ds2_pending_activechannel;
     double timebasedelayoffset;

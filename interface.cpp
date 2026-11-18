@@ -1231,6 +1231,8 @@ void UI_Mainwindow::acqButtonClicked()
               actionList[5]->setChecked(true);
             }
   }
+  // Speichertiefe bei STOP nicht veraenderbar
+  submenumemdepth.setEnabled(devparms.triggerstatus != 5);
   menu.addMenu(&submenumemdepth);
 
   menu.exec(acqButton->mapToGlobal(QPoint(0,0)));

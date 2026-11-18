@@ -93,6 +93,12 @@ private:
     int ds2_trigger_sync_valid;
     int ds2_trigger_sync_source;
     double ds2_trigger_sync_level;
+    // DS2302: Positionssynchronisierung
+    int ds2_position_sync_valid;
+    double ds2_position_chanoffset[2];
+    double ds2_position_timeoffset;
+    int ds2_last_scope_activechannel;
+    int ds2_pending_activechannel;
     double timebasedelayoffset;
     double timebasedelayscale;
 
@@ -122,7 +128,7 @@ private:
   } params;
 
   QElapsedTimer ds2_trigger_sync_timer;
-
+  QElapsedTimer ds2_position_sync_timer;
   struct tmcdev *device;
 
   struct device_settings *deviceparms;

@@ -36,6 +36,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <QElapsedTimer>
 
 
 #define SPECT_LOG_MINIMUM (0.00000001)
@@ -157,8 +158,7 @@ bool ds2_capture_channel(struct tmcdev *device, int ch, int depth,
     // Observed with 280000 samples: READ,0 -> READ,126945 -> IDLE,153055.
     // A zero-length block is NOT a transfer error while status is READ.
     int consecutive_empty_blocks = 0;
-    for(int block = 0; block < 32 && result.bytes.size() < depth; ++block)
-    {
+    for(int block = 0; block < 128 && result.bytes.size() < depth; ++block)    {
       QString status;
       if(!ds2_scpi_query(device, ":WAV:STAT?", status) ||
          !ds2_scpi_write(":WAV:DATA?"))
@@ -192,9 +192,9 @@ bool ds2_capture_channel(struct tmcdev *device, int ch, int depth,
               .arg(result.bytes.size()).arg(depth);
           break;
         }
-        if(consecutive_empty_blocks >= 5)
+        if(consecutive_empty_blocks >= 20)
         {
-          why = "RAW: 5 leere READ-Bloecke hintereinander";
+          why = "RAW: 20 leere READ-Bloecke hintereinander";
           break;
         }
         usleep(100000);  // Give the stopped DS2302 time to prepare data.
@@ -366,7 +366,7 @@ void ds2_raw_publish(unsigned generation, const DS2RawSnapshot &state)
   }
   // Failed refresh does not destroy a previously successful cache.
   ds2_raw_state.message = state.message;
-  ds2_raw_state.enabled = visible;
+  ds2_raw_state.enabled = visible && ds2_has_cached_locked();
   ds2_raw_state.busy = false;
   ds2_raw_state.progress_done = ds2_raw_state.progress_total;
 }
@@ -376,10 +376,13 @@ void screen_thread::set_device(struct tmcdev *tmdev)
   params.cmd_cue_idx_in = 0;
   params.cmd_cue_idx_out = 0;
   params.connected = 0;
+  params.ds2_last_scope_activechannel = -1;
+  params.ds2_pending_activechannel = -1;
 
   device = tmdev;
 
   ds2_trigger_sync_timer.start();
+  ds2_position_sync_timer.start();
 }
 
 
@@ -400,6 +403,7 @@ screen_thread::screen_thread()
   params.cmd_cue_idx_out = 0;
   params.connected = 0;
   params.ds2_trigger_sync_valid = 0;
+  params.ds2_position_sync_valid = 0;
 }
 
 
@@ -472,6 +476,19 @@ void screen_thread::get_params(struct device_settings *dev_parms)
   dev_parms->thread_error_line = params.error_line;
   dev_parms->cmd_cue_idx_out = params.cmd_cue_idx_out;
   dev_parms->thread_result = params.result;
+  // DS2302: Aktive Kanalauswahl nur bei einer Aenderung uebernehmen
+  if(params.modelserie == 2 &&
+      params.ds2_pending_activechannel >= 0)
+  {
+      const int ch = params.ds2_pending_activechannel;
+
+      if(ch < MAX_CHNS && params.chandisplay[ch])
+      {
+          dev_parms->activechannel = ch;
+      }
+
+      params.ds2_pending_activechannel = -1;
+  }
   dev_parms->thread_job = params.job;
 
   // Laeuft im GUI-Thread: die beiden zusammengehoerigen Werte atomar
@@ -484,6 +501,16 @@ void screen_thread::get_params(struct device_settings *dev_parms)
       dev_parms->triggeredgelevel[chn] = params.ds2_trigger_sync_level;
       dev_parms->triggeredgesource = chn;
     }
+  }
+  // DS2302: Positionen aus dem Scope uebernehmen.
+  if(params.modelserie == 2 && params.ds2_position_sync_valid)
+  {
+      dev_parms->chanoffset[0] = params.ds2_position_chanoffset[0];
+      dev_parms->chanoffset[1] = params.ds2_position_chanoffset[1];
+      dev_parms->timebaseoffset = params.ds2_position_timeoffset;
+
+      dev_parms->chandisplay[0] = params.chandisplay[0];
+      dev_parms->chandisplay[1] = params.chandisplay[1];
   }
   if(dev_parms->thread_job == TMC_THRD_JOB_TRIGEDGELEV)
   {
@@ -668,6 +695,136 @@ int screen_thread::get_devicestatus()
     }
   }
 
+  // DS2302: CH1-, CH2- und Horizontalposition synchronisieren.
+  if(params.modelserie == 2 &&
+      ds2_position_sync_timer.isValid() &&
+      ds2_position_sync_timer.elapsed() >= 1000)
+  {
+      ds2_position_sync_timer.restart();
+
+      QString ch1_text, ch2_text, time_text;
+      QString disp1_text, disp2_text;
+
+      if(!ds2_scpi_query(device, ":CHAN1:OFFS?", ch1_text) ||
+          !ds2_scpi_query(device, ":CHAN2:OFFS?", ch2_text) ||
+          !ds2_scpi_query(device, ":TIM:OFFS?", time_text) ||
+          !ds2_scpi_query(device, ":CHAN1:DISP?", disp1_text) ||
+          !ds2_scpi_query(device, ":CHAN2:DISP?", disp2_text))
+      {
+          line = __LINE__;
+          goto OUT_ERROR;
+      }
+
+      bool ok1 = false, ok2 = false, ok3 = false;
+
+      const double ch1 = ch1_text.toDouble(&ok1);
+      const double ch2 = ch2_text.toDouble(&ok2);
+      const double tim = time_text.toDouble(&ok3);
+
+      if(ok1 && ok2 && ok3 &&
+          std::isfinite(ch1) &&
+          std::isfinite(ch2) &&
+          std::isfinite(tim))
+      {
+          params.ds2_position_chanoffset[0] = ch1;
+          params.ds2_position_chanoffset[1] = ch2;
+          params.ds2_position_timeoffset = tim;
+          const QString d1 = disp1_text.trimmed();
+          const QString d2 = disp2_text.trimmed();
+
+          if((d1 == "0" || d1 == "1") &&
+              (d2 == "0" || d2 == "1"))
+          {
+              params.chandisplay[0] = (d1 == "1");
+              params.chandisplay[1] = (d2 == "1");
+          }
+          params.ds2_position_sync_valid = 1;
+      }
+  }
+
+  // DS2302: Diagnose des aktiven Kanals aus dem Setup-Binaerblock
+  if(params.modelserie == 2)
+  {
+      static QElapsedTimer setup_timer;
+      static int last_channel_mask = -1;
+
+      const int channel_mask =
+          (params.chandisplay[0] ? 1 : 0) |
+          (params.chandisplay[1] ? 2 : 0);
+
+      if(!setup_timer.isValid() ||
+          setup_timer.elapsed() >= 5000 ||
+          channel_mask != last_channel_mask)
+      {
+          setup_timer.start();
+          last_channel_mask = channel_mask;
+
+          if(ds2_scpi_write(":SYST:SET?"))
+          {
+              const int n = tmc_read();
+
+              if(n > 0 && device && device->buf)
+              {
+                  const unsigned char *data =
+                      reinterpret_cast<const unsigned char *>(device->buf);
+
+                  int len = n;
+
+                  // Manche Empfangspfade liefern den IEEE-488.2-Header mit.
+                  if(len >= 11 &&
+                      data[0] == '#' && data[1] == '9' &&
+                      std::memcmp(data + 2, "000002814", 9) == 0)
+                  {
+                      data += 11;
+                      len -= 11;
+                  }
+
+                  // 2814 Nutzbytes, ggf. mit abschliessendem LF.
+                  if((len == 2814 ||
+                       (len == 2815 && data[2814] == '\n')) &&
+                      std::memcmp(data + 4, "DS2A1", 5) == 0)
+                  {
+                      const int a = data[1011];
+                      const int b = data[1889];
+
+                      if((a == 1 && b == 0) ||
+                          (a == 2 && b == 1))
+                      {
+                          const int selected = a - 1;  // CH1 -> 0, CH2 -> 1
+
+                          if(selected != params.ds2_last_scope_activechannel)
+                          {
+                              params.ds2_last_scope_activechannel = selected;
+                              params.ds2_pending_activechannel = selected;
+                          }
+                          fprintf(stderr,
+                                  "DS2302 SETUP: CH%d aktiv, Mask=%d, Bytes=%d\n",
+                                  a, channel_mask, n);
+                      }
+                      else
+                      {
+                          fprintf(stderr,
+                                  "DS2302 SETUP: unerwartete Werte %d / %d\n",
+                                  a, b);
+                      }
+                  }
+                  else
+                  {
+                      fprintf(stderr,
+                              "DS2302 SETUP: unbekanntes Datenformat, Bytes=%d\n",
+                              n);
+                  }
+              }
+              else
+              {
+                  fprintf(stderr,
+                          "DS2302 SETUP: Leseversuch fehlgeschlagen (%d)\n",
+                          n);
+              }
+          }
+      }
+  }
+
   if(params.countersrc)
   {
     usleep(TMC_GDS_DELAY);
@@ -846,6 +1003,7 @@ void screen_thread::run()
   params.job = TMC_THRD_JOB_NONE;
 
   params.ds2_trigger_sync_valid = 0;
+  params.ds2_position_sync_valid = 0;
 
   params.wavebufsz = 0;
 

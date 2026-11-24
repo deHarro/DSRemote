@@ -2952,65 +2952,204 @@ void SignalCurve::drawTopLabels(QPainter *painter)
 
   painter->setPen(Qt::gray);
 
-  if(devparms->timebasedelayenable)
+  // DS2000: reproduce the horizontal memory overview from the actual time
+  // intervals rather than the old offset/ratio mix. This is VISUAL only:
+  // no change to timebase, waveform data, SCPI, or local zoom operation.
+  if(devparms->modelserie == 2 && !devparms->timebasedelayenable &&
+     !devparms->math_fft && devparms->hordivisions > 0 &&
+     devparms->timebasescale > 0.0)
   {
-    dtmp1 = devparms->timebasedelayscale / devparms->timebasescale;
+    const double baseSpan = devparms->hordivisions * devparms->timebasescale;
+    double zoom = property("ds2_zoom_factor").toDouble();
+    if(!(zoom >= 1.0) || !std::isfinite(zoom)) zoom = 1.0;
 
-    dtmp2 = (devparms->timebaseoffset - devparms->timebasedelayoffset) / ((devparms->hordivisions / 2) * devparms->timebasescale);
+    double zoomCenter = property("ds2_zoom_center").toDouble();
+    if(!std::isfinite(zoomCenter)) zoomCenter = 0.5;
+    zoomCenter = std::max(0.0, std::min(1.0, zoomCenter));
 
-    tmp = (116 - (dtmp1 * 116)) - (dtmp2 * 116);
+    const double visibleSpan = baseSpan / zoom;
+    const double visibleCenter = devparms->timebaseoffset +
+                                  (zoomCenter - 0.5) * baseSpan;
 
-    if(tmp > 0)
+    // The physical acquisition is fixed after SINGLE/STOP. If a RAW
+    // snapshot is displayed, use that snapshot's actual sample interval.
+    double recordSpan = 0.0;
+    const DS2RawSnapshot snapshot = ds2_raw_snapshot();
+    if(snapshot.enabled && !snapshot.busy)
     {
-      painter->fillRect(288, 16, tmp, 8, QColor(64, 160, 255));
+      for(int ch = 0; ch < 4; ++ch)
+      {
+        const DS2RawTrace &trace = snapshot.traces[ch];
+        if(trace.valid() && trace.bytes.size() > 1)
+        {
+          recordSpan = (trace.bytes.size() - 1) * trace.xincrement;
+          break;
+        }
+      }
+    }
+    if(!(recordSpan > 0.0) && devparms->acquirememdepth > 1000 &&
+       devparms->samplerate > 0.0)
+      recordSpan = devparms->acquirememdepth / devparms->samplerate;
+    if(!(recordSpan > 0.0) || !std::isfinite(recordSpan))
+      recordSpan = baseSpan;
+
+    const double left = 289.0;
+    const double width = 231.0;
+    const QColor hiddenColor(64, 160, 255);
+    const auto clamp01 = [](double x) { return std::max(0.0, std::min(1.0, x)); };
+
+    double waveStart = left;
+    double waveEnd = left + width;
+    double visibleWindowStart = left;
+    double visibleWindowEnd = left + width;
+    // For zoom-out, a miniature of the complete record remains inside the
+    // overview frame. Any portion outside the current screen is backed by a
+    // blue bar instead of moving the miniature partly out of the frame.
+    double hiddenWaveLeft = 0.0;
+    double hiddenWaveRight = 0.0;
+
+    // The same horizontal trigger fraction is used by the large T marker.
+    // While dragging, use the current mouse position without waiting for a
+    // fresh scope-settings poll.
+    double triggerFraction = 0.5 - devparms->timebaseoffset / baseSpan;
+    const int plotWidth = this->width() - 2 * bordersize;
+    if(trig_pos_arrow_moving && plotWidth > 0)
+      triggerFraction = double(trig_pos_arrow_pos) / plotWidth;
+    if(!std::isfinite(triggerFraction)) triggerFraction = 0.5;
+
+    painter->save();
+    painter->setClipRect(QRectF(left, 16, width, 8), Qt::IntersectClip);
+
+    if(recordSpan > visibleSpan)
+    {
+      // The screen shows only part of the captured record. The blue
+      // outer sections are the memory portions outside the visible window.
+      // Positive TIM:OFFS shifts the visible window toward later samples.
+      const double windowBegin = clamp01(0.5 +
+                          (visibleCenter - visibleSpan / 2.0) / recordSpan);
+      const double windowEnd = clamp01(0.5 +
+                          (visibleCenter + visibleSpan / 2.0) / recordSpan);
+      // Blue bars indicate the portions outside the visible time window,
+      // but are drawn BEHIND the zig-zag just as on the original Rigol.
+      // The symbolic wave therefore spans the complete overview frame.
+      // Keep the free-window bounds separately for the trigger marker.
+      visibleWindowStart = left + width * windowBegin;
+      visibleWindowEnd = left + width * windowEnd;
+      painter->fillRect(QRectF(left, 16, width * windowBegin, 8), hiddenColor);
+      painter->fillRect(QRectF(left + width * windowEnd, 16,
+                               width * (1.0 - windowEnd), 8), hiddenColor);
+    }
+    else
+    {
+      // Zooming OUT after SINGLE/STOP: the symbolic wave has a fixed,
+      // shorter extent (recordSpan / visibleSpan). When it reaches either
+      // boundary, keep this entire miniature INSIDE the overview frame.
+      // Back the off-screen portion with the corresponding blue bar.
+      const double miniatureWidth = width * recordSpan / visibleSpan;
+      const double triggerX = trig_pos_arrow_moving
+                              ? left + width * triggerFraction
+                              : left + width * (0.5 - visibleCenter / visibleSpan);
+      const double unboundedStart = triggerX - miniatureWidth / 2.0;
+      waveStart = std::max(left, std::min(left + width - miniatureWidth,
+                                         unboundedStart));
+      waveEnd = waveStart + miniatureWidth;
+      hiddenWaveLeft = std::min(miniatureWidth,
+                                std::max(0.0, waveStart - unboundedStart));
+      hiddenWaveRight = std::min(miniatureWidth,
+                           std::max(0.0, unboundedStart + miniatureWidth - waveEnd));
     }
 
-    x1 = (116 - (dtmp1 * 116)) + (dtmp2 * 116);
+    // Blue bars are BACKGROUND, not masks: draw them BEFORE the zig-zag.
+    // The white wave stays visible even over the blue region, like the Rigol.
+    if(hiddenWaveLeft > 0.0)
+      painter->fillRect(QRectF(waveStart, 16, hiddenWaveLeft, 8), hiddenColor);
+    if(hiddenWaveRight > 0.0)
+      painter->fillRect(QRectF(waveEnd - hiddenWaveRight, 16,
+                               hiddenWaveRight, 8), hiddenColor);
 
-    if(x1 > 0)
+    // This zig-zag is a SYMBOL, not a thumbnail of the acquired signal.
+    // Keep its original ~12 px wavelength even when its extent changes.
+    if(waveEnd > waveStart + 0.5)
     {
-      painter->fillRect(288 + 233 - x1, 16, x1, 8, QColor(64, 160, 255));
+      painter->save();
+      painter->setClipRect(QRectF(waveStart, 16, waveEnd - waveStart, 8),
+                           Qt::IntersectClip);
+      painter->setPen(Qt::white);
+      QPainterPath zigzag;
+      zigzag.moveTo(waveStart, 20);
+      const double dy[] = {22, 22, 18, 18, 22};
+      const double dx[] = {2, 4, 8, 10, 12};
+      for(double base = waveStart; base < waveEnd; base += 12.0)
+        for(int j = 0; j < 5; ++j)
+          zigzag.lineTo(base + dx[j], dy[j]);
+      painter->drawPath(zigzag);
+      painter->restore();
     }
+    painter->restore();
+
+    painter->setPen(Qt::gray);
+    painter->drawRect(288, 16, 233, 8);
+
+    // The little T marker has the SAME relative position as the large T
+    // marker, but inside the CURRENT VISIBLE memory window. When zoomed in,
+    // the blue areas are outside that window and must never contain the T.
+    // At the original timebase this reduces to the full overview width.
+    const double markerStart = (recordSpan > visibleSpan) ? visibleWindowStart : left;
+    const double markerWidth = (recordSpan > visibleSpan)
+                               ? std::max(0.0, visibleWindowEnd - visibleWindowStart) : width;
+    // When zoomed OUT, the T remains at the centre of the full miniature.
+    // If the miniature reaches an outer edge, its covered time is indicated
+    // by a blue background; the T stops at that bar's INNER edge.
+    const double markerPosition = (recordSpan > visibleSpan)
+        ? markerStart + markerWidth * clamp01(triggerFraction)
+        : (recordSpan < visibleSpan)
+            ? (waveStart + waveEnd) / 2.0
+            : left + width * clamp01(triggerFraction);
+    const int markerX = int(std::lround(markerPosition));
+    painter->save();
+    painter->setClipRect(QRect(284, 5, 242, 12), Qt::IntersectClip);
+    drawSmallTriggerArrow(painter, markerX, 15, 1, QColor(255, 128, 0));
+    painter->restore();
   }
-  else if(devparms->acquirememdepth > 1000)
+  else
   {
-    dtmp1 = (devparms->hordivisions * devparms->timebasescale) / (devparms->acquirememdepth / devparms->samplerate);
+    // Original DSRemote rendering for the other model series and for
+    // the Rigol's dedicated delayed timebase / FFT modes.
+    painter->save();
+    painter->setClipRect(QRect(288, 16, 233, 8), Qt::IntersectClip);
 
-    dtmp2 = devparms->timebaseoffset / dtmp1;
-
-    tmp = (116 - (dtmp1 * 116)) - (dtmp2 * 116);
-
-    if(tmp > 0)
+    if(devparms->timebasedelayenable)
     {
-      painter->fillRect(288, 16, tmp, 8, QColor(64, 160, 255));
+      dtmp1 = devparms->timebasedelayscale / devparms->timebasescale;
+      dtmp2 = (devparms->timebaseoffset - devparms->timebasedelayoffset) / ((devparms->hordivisions / 2) * devparms->timebasescale);
+      tmp = (116 - (dtmp1 * 116)) - (dtmp2 * 116);
+      if(tmp > 0) painter->fillRect(288, 16, tmp, 8, QColor(64, 160, 255));
+      x1 = (116 - (dtmp1 * 116)) + (dtmp2 * 116);
+      if(x1 > 0) painter->fillRect(288 + 233 - x1, 16, x1, 8, QColor(64, 160, 255));
     }
-
-    x1 = (116 - (dtmp1 * 116)) + (dtmp2 * 116);
-
-    if(x1 > 0)
+    else if(devparms->acquirememdepth > 1000 && devparms->samplerate > 0.0)
     {
-      painter->fillRect(288 + 233 - x1, 16, x1, 8, QColor(64, 160, 255));
+      dtmp1 = (devparms->hordivisions * devparms->timebasescale) / (devparms->acquirememdepth / devparms->samplerate);
+      dtmp2 = devparms->timebaseoffset / dtmp1;
+      tmp = (116 - (dtmp1 * 116)) - (dtmp2 * 116);
+      if(tmp > 0) painter->fillRect(288, 16, tmp, 8, QColor(64, 160, 255));
+      x1 = (116 - (dtmp1 * 116)) + (dtmp2 * 116);
+      if(x1 > 0) painter->fillRect(288 + 233 - x1, 16, x1, 8, QColor(64, 160, 255));
     }
+    painter->restore();
+
+    painter->drawRect(288, 16, 233, 8);
+    painter->setPen(Qt::white);
+    painter->drawLine(289, 20, 291, 22);
+    for(i=0; i<19; i++)
+    {
+      painter->drawLine((i * 12) + 291, 22, (i * 12) + 293, 22);
+      painter->drawLine((i * 12) + 297, 18, (i * 12) + 299, 18);
+      painter->drawLine((i * 12) + 294, 21, (i * 12) + 296, 19);
+      painter->drawLine((i * 12) + 300, 19, (i * 12) + 302, 21);
+    }
+    painter->drawLine(519, 22, 520, 22);
   }
-
-  painter->drawRect(288, 16, 233, 8);
-
-  painter->setPen(Qt::white);
-
-  painter->drawLine(289, 20, 291, 22);
-
-  for(i=0; i<19; i++)
-  {
-    painter->drawLine((i * 12) + 291, 22, (i * 12) + 293, 22);
-
-    painter->drawLine((i * 12) + 297, 18, (i * 12) + 299, 18);
-
-    painter->drawLine((i * 12) + 294, 21, (i * 12) + 296, 19);
-
-    painter->drawLine((i * 12) + 300, 19, (i * 12) + 302, 21);
-  }
-
-  painter->drawLine(519, 22, 520, 22);
 
 //////////////// delay ///////////////////////////////
 

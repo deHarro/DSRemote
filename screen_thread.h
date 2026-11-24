@@ -134,6 +134,9 @@ private:
     char debug_str[1024];
   } params;
 
+  // A/B-Test: LAN NORM/BYTE nur beim Verbinden konfigurieren.
+  bool ds2_norm_setup_pending = true;
+
   QElapsedTimer ds2_trigger_sync_timer;
   QElapsedTimer ds2_position_sync_timer;
   struct tmcdev *device;

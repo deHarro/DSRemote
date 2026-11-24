@@ -143,6 +143,10 @@ private:
                *settingsmenu,
                *helpmenu;
 
+  // Keep the Device menu entries so their enabled state follows the connection.
+  QAction      *deviceConnectAction,
+               *deviceDisconnectAction;
+
   QTimer       *adjdial_timer,
                *navDial_timer,
                *horPosDial_timer,
@@ -251,6 +255,12 @@ private:
   inline unsigned char reverse_bitorder_8(unsigned char);
   inline unsigned int reverse_bitorder_32(unsigned int);
   int get_device_settings(int delay=0);
+
+  // DS2302: SINGLE display latch while the asynchronous :SING command
+  // is queued and during the subsequent acquisition.
+  bool ds2SingleRequested = false;
+  bool ds2SingleCommandProcessed = false;
+  void updateAcquisitionButtonStyles();
 
 private slots:
 

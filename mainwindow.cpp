@@ -66,6 +66,10 @@ void UI_Mainwindow::open_connection()
     return;
   }
 
+  // A connection dialog can run a nested Qt event loop: prevent repeated attempts.
+  deviceConnectAction->setEnabled(false);
+  deviceDisconnectAction->setEnabled(false);
+
   strlcpy(str, settings.value("connection/type", "USB").toString().toLatin1().data(), 4096);
 
   if(!strcmp(str, "LAN"))
@@ -419,11 +423,17 @@ void UI_Mainwindow::open_connection()
 
   devparms.connected = 1;
 
+  // The device has passed identification and settings initialization.
+  deviceDisconnectAction->setEnabled(true);
+
 //  test_timer->start(2000);
 
   DPRwidget->setEnabled(true);
 
   devparms.screenupdates_on = 1;
+
+  ds2SingleRequested = false;
+  ds2SingleCommandProcessed = false;
 
   scrn_thread->h_busy = 0;
 
@@ -448,6 +458,8 @@ OC_OUT_ERROR:
 
 void UI_Mainwindow::close_connection()
 {
+  ds2SingleRequested = false;
+  ds2SingleCommandProcessed = false;
   DPRwidget->setEnabled(false);
 
   test_timer->stop();
@@ -551,6 +563,10 @@ void UI_Mainwindow::close_connection()
   }
 
   statusLabel->setText("Disconnected");
+
+  // Restore the menu only after releasing the device and closing the socket.
+  deviceConnectAction->setEnabled(true);
+  deviceDisconnectAction->setEnabled(false);
 
   printf("Disconnected from device\n");
 }
@@ -2774,6 +2790,47 @@ void UI_Mainwindow::set_to_factory()
 }
 
 
+// DS2302_SINGLE_STATUS_GUI_V1: GUI-only indication; no extra SCPI traffic.
+// A local latch keeps the SINGLE indication visible immediately after a
+// button click, before the worker has processed :SING or polled :TRIG:STAT?.
+void UI_Mainwindow::updateAcquisitionButtonStyles()
+{
+  if(devparms.modelserie == 2)
+  {
+    const bool stopped = (devparms.triggerstatus == 4 || devparms.triggerstatus == 5);
+    const bool singleActive = ds2SingleRequested ||
+                              (devparms.triggersweep == 2 &&
+                               (devparms.triggerstatus == 0 || devparms.triggerstatus == 1));
+    if(singleActive)
+    {
+      runButton->setStyleSheet("background: #AAAAAA;");  // Inactive RUN/STOP
+      singleButton->setStyleSheet("background: #FF9966;"); // SINGLE armed / acquiring
+    }
+    else if(stopped)
+    {
+      runButton->setStyleSheet("background: #FF0066;");  // STOP / FIN
+      singleButton->setStyleSheet("background: #AAAAAA;");
+    }
+    else
+    {
+      runButton->setStyleSheet("background: #66FF99;");  // RUN
+      singleButton->setStyleSheet("background: #AAAAAA;");
+    }
+    return;
+  }
+
+  // Keep the original behavior for other instrument families.
+  runButton->setStyleSheet(def_stylesh);
+  singleButton->setStyleSheet(def_stylesh);
+  if(devparms.triggerstatus == 0 || devparms.triggerstatus == 2 ||
+     devparms.triggerstatus == 3)
+    runButton->setStyleSheet("background: #66FF99;");
+  else if(devparms.triggerstatus == 1)
+    singleButton->setStyleSheet("background: #FF9966;");
+  else if(devparms.triggerstatus == 5)
+    runButton->setStyleSheet("background: #FF0066;");
+}
+
 // this function is called when screen_thread has finished
 void UI_Mainwindow::screenUpdate()
 {
@@ -2803,6 +2860,25 @@ void UI_Mainwindow::screenUpdate()
   }
 
   scrn_thread->get_params(&devparms);
+
+  if(devparms.modelserie == 2 && ds2SingleRequested)
+  {
+    // Do not misinterpret a stale pre-SINGLE STOP/FIN sample as completion.
+    // First wait until the queued :SING command was handled by the worker.
+    if(devparms.thread_result == TMC_THRD_RESULT_CMD &&
+       devparms.cmd_cue_idx_out == devparms.cmd_cue_idx_in)
+      ds2SingleCommandProcessed = true;
+
+    if(ds2SingleCommandProcessed &&
+       devparms.thread_result == TMC_THRD_RESULT_SCRN &&
+       (devparms.triggerstatus == 4 || devparms.triggerstatus == 5))
+    {
+      ds2SingleRequested = false;
+      ds2SingleCommandProcessed = false;
+      statusLabel->setText("Trigger: single finished");
+    }
+  }
+  updateAcquisitionButtonStyles();
 
   if(devparms.thread_error_stat)
   {
@@ -2850,31 +2926,6 @@ void UI_Mainwindow::screenUpdate()
 
     return;
   }
-
-  runButton->setStyleSheet(def_stylesh);
-
-  singleButton->setStyleSheet(def_stylesh);
-
-  if(devparms.triggerstatus == 0)
-  {
-    runButton->setStyleSheet("background: #66FF99;");
-  }
-  else if(devparms.triggerstatus == 1)
-    {
-      singleButton->setStyleSheet("background: #FF9966;");
-    }
-    else if(devparms.triggerstatus == 2)
-      {
-        runButton->setStyleSheet("background: #66FF99;");
-      }
-      else if(devparms.triggerstatus == 3)
-        {
-          runButton->setStyleSheet("background: #66FF99;");
-        }
-        else if(devparms.triggerstatus == 5)
-          {
-            runButton->setStyleSheet("background: #FF0066;");
-          }
 
   if(devparms.triggersweep == 0)
   {

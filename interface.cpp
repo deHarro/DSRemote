@@ -3511,16 +3511,29 @@ void UI_Mainwindow::autoButtonClicked()
 
 void UI_Mainwindow::runButtonClicked()
 {
-  if(devparms.triggerstatus == 5)
+  // FIN is a completed SINGLE acquisition and must behave like STOP.
+  if(devparms.triggerstatus == 5 || devparms.triggerstatus == 4)
   {
+    ds2SingleRequested = false;
+    ds2SingleCommandProcessed = false;
     statusLabel->setText("Trigger: run");
-
+    if(devparms.modelserie == 2)
+    {
+      runButton->setStyleSheet("background: #66FF99;");
+      singleButton->setStyleSheet("background: #AAAAAA;");
+    }
     set_cue_cmd(":RUN");
   }
   else
   {
+    ds2SingleRequested = false;
+    ds2SingleCommandProcessed = false;
     statusLabel->setText("Trigger: stop");
-
+    if(devparms.modelserie == 2)
+    {
+      runButton->setStyleSheet("background: #FF0066;");
+      singleButton->setStyleSheet("background: #AAAAAA;");
+    }
     set_cue_cmd(":STOP");
   }
 }
@@ -3529,7 +3542,12 @@ void UI_Mainwindow::runButtonClicked()
 void UI_Mainwindow::singleButtonClicked()
 {
   statusLabel->setText("Trigger: single");
-
+  if(devparms.modelserie == 2)
+  {
+    ds2SingleRequested = true;
+    ds2SingleCommandProcessed = false;
+    updateAcquisitionButtonStyles();
+  }
   set_cue_cmd(":SING");
 }
 

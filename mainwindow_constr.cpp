@@ -186,8 +186,9 @@ UI_Mainwindow::UI_Mainwindow()
 
   devicemenu = new QMenu(this);
   devicemenu->setTitle("Device");
-  devicemenu->addAction("Connect",    this, SLOT(open_connection()));
-  devicemenu->addAction("Disconnect", this, SLOT(close_connection()));
+  deviceConnectAction = devicemenu->addAction("Connect",    this, SLOT(open_connection()));
+  deviceDisconnectAction = devicemenu->addAction("Disconnect", this, SLOT(close_connection()));
+  deviceDisconnectAction->setEnabled(false); // Not connected at startup.
   devicemenu->addAction("Exit",       this, SLOT(close()), QKeySequence::Quit);
   menubar->addMenu(devicemenu);
 

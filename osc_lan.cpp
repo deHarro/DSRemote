@@ -1,6 +1,7 @@
 #include "osc_lan.h"
 #include <algorithm>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
 #include <vector>
 
@@ -51,7 +52,20 @@ struct osclan::Impl {
         if(fd == INVALID_FD) return -1;
         char temp[16384];
         const int n = ::recv(fd, temp, sizeof(temp), 0);
-        if(n <= 0) return n == 0 ? 0 : -1;
+        if(n <= 0) {
+            // Diagnostic only: 10060=timeout, 10054=connection reset on Windows.
+#ifdef _WIN32
+            const int socket_error = (n < 0) ? WSAGetLastError() : 0;
+            std::fprintf(stderr,
+                         "DS2302 LAN-DIAG: recv() returned %d, WSA error=%d (10060=timeout, 10054=reset)\n",
+                         n, socket_error);
+#else
+            std::fprintf(stderr, "DS2302 LAN-DIAG: recv() returned %d, errno=%d\n",
+                         n, (n < 0) ? errno : 0);
+#endif
+            std::fflush(stderr);
+            return n == 0 ? 0 : -1;
+        }
         unread.assign(temp, temp + n);
         next = 0;
         return n;
@@ -194,7 +208,13 @@ int osclan::readExact(char *data, int len) {
     int received = 0;
     while(received < len) {
         int n = read(data + received, len - received);
-        if(n <= 0) return -1;
+        if(n <= 0) {
+            std::fprintf(stderr,
+                         "DS2302 LAN-DIAG: readExact interrupted after %d/%d bytes; read returned %d\n",
+                         received, len, n);
+            std::fflush(stderr);
+            return -1;
+        }
         received += n;
     }
     return received;

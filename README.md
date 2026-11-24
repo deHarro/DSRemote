@@ -1,14 +1,26 @@
-# DSRemote — Windows 11 / Rigol DS2000 RAW Edition
+# DSRemote — Windows 11 / Rigol DS2000 LAN + RAW Edition
 
-**A Windows 11 development fork of DSRemote with high-resolution, cached RAW waveform snapshots, interactive zoom and measurement cursors.**
+**A Windows 11 development fork of DSRemote with direct Rigol LAN control, live waveform display, high-resolution RAW snapshots, interactive zoom and measurement cursors.**
 
 This fork builds on the [Windows port by pvvx](https://github.com/pvvx/DSRemote), which itself is based on [DSRemote by Teunis van Beelen (Teuniz)](https://www.teuniz.net/DSRemote/). It focuses on making a Rigol DS2000-series oscilloscope useful as a high-resolution desktop measurement instrument.
 
-> **Stable reference:** `dsremote-raw-v1.8` (13 November 2026)  
-> **Tested instrument:** Rigol DS2302, firmware `00.03.06`  
+> **Current development state:** 24 November 2026 — LAN/NORM recovery, RUN/SINGLE and horizontal overview V3c (locally tested; Git tag pending)  
+> **Earlier stable RAW reference:** `dsremote-raw-v1.8` (13 November 2026)  
+> **Tested instrument:** Rigol DS2202 upgraded to DS2302, firmware `00.03.06`  
 > **Tested environment:** Windows 11 · Qt 5.15.2 · MinGW 8.1, 64-bit
 
 ## What's different in this fork?
+
+### Direct LAN communication and live acquisition
+
+DSRemote connects **directly** to the oscilloscope's LAN interface from its Qt/C++ application. The current DS2302 path sends SCPI commands and receives waveform responses using a **TCP socket on port 5555 of the oscilloscope** (`osc_lan.cpp`). The former separate Python/VXI-11 bridge is **no longer needed** for normal operation.
+
+- Live **NORM/BYTE** waveform display, normally up to 1,400 displayed points per enabled channel.
+- **RUN, STOP and SINGLE** handling, including live display during a SINGLE acquisition and the corresponding button states.
+- **NORM recovery** for occasional malformed or unexpectedly terminated SCPI binary blocks, limiting disruption to subsequent reads.
+- **Connect/Disconnect** menu items enable and disable according to connection state.
+
+**Known limitation:** At slow time bases, especially around 200 ms/div, the waveform made available via SCPI may update only every second acquisition. Standalone NORM/MAX probes exhibit similar delays; the root cause is not yet resolved. This does not imply the scope's own screen stops updating.
 
 ### High-resolution RAW acquisition
 
@@ -34,6 +46,7 @@ Both enabled channels can be captured from the same stopped acquisition. They ar
 - A visible `Ansicht: .../div` label for the effective *on-screen* time scale.
 - Zoom and pan change the **display only**, not the oscilloscope's acquisition time base.
 - Trigger-position handling and cursor positions remain consistent when zooming or changing the instrument's time base.
+- A **horizontal acquisition overview (V3c)** shows a schematic zigzag for the retained acquisition range, blue background bars for areas outside the visible window, and a small orange trigger-position marker. The zigzag is a *symbol*, not a miniature copy of the recorded waveform. The overview responds to instrument time-base and H-position changes, including the stop/edge cases observed on the DS2302.
 
 RAW rendering uses the received samples and an overview/detail drawing strategy. **Zooming does not increase the scope's physical sample rate or create extra measured samples.**
 
@@ -79,8 +92,9 @@ The lower status strip shows a progress bar immediately after **RAW laden** is c
 
 - Windows 11 (tested)
 - Qt Creator with **Qt 5.15.2 / MinGW 8.1, 64-bit**
-- Python 3 with the `vxi11` module for the temporary bridge (commonly installed with `py -m pip install python-vxi11`)
-- A compatible Rigol oscilloscope reachable over the local network
+- A compatible Rigol oscilloscope reachable over the local network, with its SCPI/TCP service accessible on port **5555**
+
+**Python is not required** to build or run DSRemote. Optional standalone Python scripts are used only for development or diagnostics.
 
 The Windows project links against Winsock with `win32:LIBS += -lws2_32` in `dsremote.pro`.
 
@@ -89,38 +103,40 @@ The Windows project links against Winsock with `win32:LIBS += -lws2_32` in `dsre
 1. Clone this fork and open **`dsremote.pro`** in Qt Creator.
 2. Select the **Desktop Qt 5.15.2 MinGW 64-bit** kit.
 3. Configure the desired Debug or Release build and build the project.
-4. Run the Python bridge and then start DSRemote.
+4. Start DSRemote. Open **Settings** and select the **LAN** connection; enter the **oscilloscope's own IP address or hostname**.
+5. Select **Device → Connect**. No external bridge process or localhost proxy is required.
 
 Qt runtime DLLs, generated `build/` directories, executables and personal Qt Creator `*.pro.user*` settings are deliberately excluded from new commits by `.gitignore`. Build and runtime dependencies must be provided on the local machine.
 
 ### Current LAN architecture
 
-The current release still uses a **Python VXI-11 bridge**; native VXI-11 support in Qt is a future goal.
+The DS2000 connection is implemented directly inside DSRemote using C++/Qt and Winsock. For the tested DS2302, the application opens a normal **SCPI-over-TCP socket to the oscilloscope on port 5555**. This is **not** the previous Python VXI-11 bridge arrangement; no separate VXI-11 or proxy process needs to be running on the PC.
 
 ```text
-DSRemote (Qt/C++ on Windows)
-           |
-           | local SCPI/TCP connection
-           v
-     127.0.0.1:5555
-           |
-           v
- ds_bridge_ds2000_v4_quiet.py
-           |
-           | VXI-11 over the LAN
-           v
-      Rigol DS2302
+ +--------------------------------+
+ | DSRemote                       |
+ | Windows 11 / Qt / C++          |
+ |                                |
+ | SCPI commands                  |
+ | NORM and RAW waveform data     |
+ +---------------+----------------+
+                 |
+                 | Direct LAN / TCP port 5555
+                 | (scope IP address)
+                 v
+ +--------------------------------+
+ | Rigol DS2202 / DS2302          |
+ | Oscilloscope                   |
+ +--------------------------------+
+
+ No Python bridge. No localhost proxy.
 ```
 
-Configure the oscilloscope's LAN address in the bridge as appropriate for your installation. Start the bridge, for example, with:
+Configure the **scope's LAN address** in DSRemote **Settings** and choose **Device → Connect**. Do **not** set the destination to `127.0.0.1` merely because old instructions mention a local bridge.
 
-```powershell
-py ds_bridge_ds2000_v4_quiet.py
-```
+**Tip:** After switching the oscilloscope on, allow its startup and network initialization to finish before connecting. An early SCPI read may fail even if initial commands are accepted. This was observed with both the current and an earlier portable executable; it is not presently attributed to the GUI patch.
 
-Then connect DSRemote to **`localhost`**, using the bridge listener on port **5555**. The bridge also handles certain DS2000 SCPI compatibility differences. It must remain running while DSRemote uses that connection.
-
-**Note:** The script and its configuration reflect the tested local setup; this is not yet a standalone, universal Windows installer.
+**Historical note:** Early development used `ds_bridge_ds2000_v4_quiet.py` and `python-vxi11` to connect a local `127.0.0.1:5555` listener to the scope. Those instructions have been retired. Python probes may still be useful as independent diagnostic tools.
 
 ## How to use RAW snapshots
 
@@ -154,7 +170,7 @@ The current implementation has a software safety limit of **1,000,000 RAW points
 
 ## Development milestones
 
-The names below document successive development steps; the published Git reference is the **V1.8 tag**.
+The names below document successive development steps. `dsremote-raw-v1.8` is a **historical RAW reference**, not the current GUI/LAN state. The 24 November 2026 changes can be recorded in a separate Git commit and tag.
 
 | Milestone | Main change |
 | --- | --- |
@@ -165,25 +181,32 @@ The names below document successive development steps; the published Git referen
 | RAW V1.6 | Added RAW buttons, explicit loading, cache and status controls |
 | RAW V1.7 | Clear LIVE/SNAPSHOT channel separation, cache preservation and stale-state indication |
 | **RAW V1.8** | Restored CH1/CH2 settings in the bottom strip and added smooth, learning-based progress indication |
+| DS2000 direct LAN | Replaced the external Python bridge with a native Qt/C++ TCP/SCPI connection to scope port 5555 |
+| NORM Recovery / RUN-SINGLE | Better handling of irregular binary blocks; live RUN/SINGLE display and button states |
+| GUI connectivity | Correct Connect/Disconnect menu enable/disable behavior |
+| **Horizontal overview V3c** | Correct visible-window bars, symbolic zigzag width, H-position, small trigger marker and drawing order (zigzag in front of blue bars) |
 
-**Verified V1.8 reference:** `dsremote-raw-v1.8`.
+**Historical RAW reference:** `dsremote-raw-v1.8` (13 November 2026).  
+**Development state:** 24 November 2026; see [`DS2302_Entwicklungsstand_2026-11-24.md`](DS2302_Entwicklungsstand_2026-11-24.md).
 
 ## Known limitations and roadmap
 
 **Current limitations**
 
 - The tested RAW path requires the instrument to be in **STOP**; it is not continuous RAW streaming.
-- The Python bridge remains necessary for the tested DS2302 LAN setup.
+- At slow time bases, external NORM waveform data may skip a sweep or update late; independent Python tests reproduce the behavior, and the cause remains unresolved.
+- Device communication may be unreliable briefly after power-on; ensure the oscilloscope has finished initialization.
 - Detailed behaviour has been tested on **one DS2302**; other models and firmware versions are not guaranteed.
 - The RAW cache is an **in-memory working snapshot**, not a persistent waveform archive or two-slot comparison system.
 - The visual zoom can show individual recorded samples but cannot recover detail beyond the acquired sample interval.
 
 **Planned improvements**
 
-- Replace the Python bridge with **native VXI-11 communication in Qt**.
-- Add small, unobtrusive **Fine / Coarse** indicators next to the horizontal and vertical scale knobs.
-- Add a **visual cursor target marker** at waveform intersections for more precise manual positioning — *without magnetic snapping or restricting free cursor movement*.
-- Continue refining DS2000-specific usability while preserving the stable RAW acquisition path.
+- Investigate the **missing/late sweep updates** at slow time bases without compromising the current NORM recovery.
+- Improve robustness for **larger RAW transfers** and occasional LAN errors.
+- Consolidate disconnect/close handling and tidy up legacy log text mentioning a TCP "bridge".
+- Consider small **Fine / Coarse** indicators next to the horizontal and vertical scale knobs.
+- Continue refining cursor targeting, recorder integration and DS2000-specific usability while preserving the working acquisition paths.
 
 ## Credits and license
 
@@ -197,7 +220,7 @@ The project retains the upstream **GNU General Public License v3**; see the repo
 
 ---
 
-*This README describes the tested Windows 11 development state at tag `dsremote-raw-v1.8`, not a claim of general compatibility with every Rigol oscilloscope.*
+*This README describes the Windows 11 / DS2302 development state as of 24 November 2026, including features added since `dsremote-raw-v1.8`. The newer commit/tag is a proposed checkpoint until actually published; compatibility with other Rigol models and firmware is not guaranteed.*
 
 ---
 
